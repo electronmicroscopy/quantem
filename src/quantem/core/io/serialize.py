@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import shutil
+import sys
 import tempfile
 import types
 import zlib
@@ -501,7 +502,7 @@ class _Reader:
             if key in self.skip_names or (
                 kind == "group"
                 and self.skip_types
-                and issubclass(_stored_class(cast(zarr.Group, group[key])), self.skip_types)
+                and issubclass(self._stored_class(cast(zarr.Group, group[key])), self.skip_types)
             ):
                 continue
             value = self._entry(group, key, kind)
@@ -620,7 +621,15 @@ class _Reader:
 
     def _class(self, group: zarr.Group) -> Any:
         """The class of the object stored in `group`, or _SKIP if it is refused."""
-        cls = _import_class(group.attrs["_autoserialize"])
+        metadata = group.attrs["_autoserialize"]
+        module_name = cast(dict, metadata)["class_module"]
+        if not self._may_import(module_name):
+            return self._refuse(
+                group.path,
+                f"{module_name}.{cast(dict, metadata)['class_name']}, "
+                "from a module outside quantem and torch that is not imported",
+            )
+        cls = _import_class(metadata)
         if not _is_object_class(cls):
             raise ValueError(
                 f"{cls.__module__}.{cls.__qualname__} is not an AutoSerialize class, "
@@ -646,6 +655,28 @@ class _Reader:
         if value is None:
             raise ValueError(f"{module_name}.{qualname} at {path} is not a class or function")
         return value
+
+    def _may_import(self, module_name: str) -> bool:
+        """Whether a class's module may be imported, which runs the module's code.
+
+        Without allow_pickle, only modules from quantem and torch, or modules
+        already imported, whose code has run already.
+        """
+        return (
+            self.allow_pickle
+            or module_name.partition(".")[0] in _TRUSTED_PACKAGES
+            or module_name in sys.modules
+        )
+
+    def _stored_class(self, group: zarr.Group) -> type:
+        """Class of the object stored in `group`, else `object`.
+
+        Also `object` when its module may not be imported; `_class` then refuses it.
+        """
+        metadata = group.attrs.get("_autoserialize")
+        if metadata is None or not self._may_import(cast(dict, metadata)["class_module"]):
+            return object
+        return _import_class(metadata)
 
     def _refuse(self, path: str, description: str) -> Any:
         self.refused.append(f"{path} ({description})")
@@ -774,12 +805,6 @@ def _json_state(value: Any) -> Any:
     if isinstance(value, np.ndarray):
         return value.tolist()
     return value.item() if isinstance(value, np.generic) else value
-
-
-def _stored_class(group: zarr.Group) -> type:
-    """Class of the object stored in `group`, else `object`."""
-    metadata = group.attrs.get("_autoserialize")
-    return _import_class(metadata) if metadata is not None else object
 
 
 def _is_object_class(cls: type) -> bool:
@@ -1003,7 +1028,9 @@ def load(path: str | Path, skip: SkipSpec = (), *, allow_pickle: bool = False) -
         and schedulers in files written before quantem stored them without
         pickle), and torch modules, optimizers, schedulers and dataclasses
         defined outside quantem and torch. These can run code stored in the
-        file, so only allow them for files from a source you trust.
+        file, so only allow them for files from a source you trust. Without
+        it, an AutoSerialize class from outside quantem and torch loads only
+        if its module is already imported.
 
     Returns
     -------

@@ -1,5 +1,6 @@
 import gzip
 import json
+import sys
 
 import dill
 import numpy as np
@@ -223,10 +224,11 @@ class Untrusted(AutoSerialize):
         self.local = _local_module()
 
 
-def test_values_that_can_run_code_load_only_with_allow_pickle(tmp_path):
+def test_values_that_can_run_code_load_only_with_allow_pickle(tmp_path, monkeypatch):
     """Dill fallbacks, in a list or in the older bare-array layout, and modules and
     functions from outside quantem and torch load only with allow_pickle=True;
-    without it, nothing stored in them runs."""
+    without it, nothing stored in them runs, and no module outside quantem and
+    torch is imported."""
     _unpickled.clear()
     tgt = tmp_path / "untrusted"
     Untrusted().save(tgt)
@@ -254,6 +256,20 @@ def test_values_that_can_run_code_load_only_with_allow_pickle(tmp_path):
     assert loaded.encode is json.dumps
     assert type(loaded.local).__name__ == "Local"
     assert sorted(_unpickled) == ["legacy", "new"]
+
+    # a class from a module that is not imported is refused without importing it,
+    # also where the skip check reads the class
+    (tmp_path / "_autoserialize_unimported.py").write_text("class Thing:\n    pass\n")
+    monkeypatch.syspath_prepend(tmp_path)
+    net_meta = dict(root["net"].attrs["_autoserialize"])
+    root["net"].attrs["_autoserialize"] = {
+        **net_meta,
+        "class_module": "_autoserialize_unimported",
+        "class_name": "Thing",
+    }
+    with pytest.raises(ValueError, match="_autoserialize_unimported.Thing, from a module outside"):
+        load(tgt, skip=[torch.optim.Optimizer])
+    assert "_autoserialize_unimported" not in sys.modules
 
     # the file can only name classes that are stored by their attributes
     meta = dict(root.attrs["_autoserialize"])
