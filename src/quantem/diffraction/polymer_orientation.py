@@ -16,10 +16,11 @@ from __future__ import annotations
 
 import matplotlib.pyplot as plt
 import numpy as np
-from emdfile import tqdmnd
 from matplotlib.colors import hsv_to_rgb, rgb_to_hsv
 from scipy.ndimage import gaussian_filter1d
+from tqdm import tqdm
 
+from quantem.core.utils.utils import tqdmnd
 from quantem.diffraction.vector_fields import vector_field_cell
 
 __all__ = [
@@ -199,7 +200,7 @@ def make_orientation_histogram(
     for a0 in range(num_radii):
         t = "Generating histogram " + str(a0)
         for rx, ry in tqdmnd(
-            *size_input, desc=t, unit=" probe positions", disable=not progress_bar
+            *map(range, size_input), desc=t, unit=" probe positions", disable=not progress_bar
         ):
             x = (rx + 0.5) * upsample_factor - 0.5
             y = (ry + 0.5) * upsample_factor - 0.5
@@ -476,9 +477,7 @@ def make_flowline_map(
 
         # for a1 in tqdmnd(range(0,40), desc="Drawing flowlines",unit=" seeds", disable=not progress_bar):
         t = "Drawing flowlines " + str(a0)
-        for a1 in tqdmnd(
-            range(0, x_inds.shape[0]), desc=t, unit=" seeds", disable=not progress_bar
-        ):
+        for a1 in tqdm(range(0, x_inds.shape[0]), desc=t, unit=" seeds", disable=not progress_bar):
             # initial coordinate and intensity
             xy0 = np.array((x_inds[a1], y_inds[a1]))
             t0 = theta[t_inds[a1]]
