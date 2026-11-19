@@ -18,6 +18,7 @@ from quantem.diffraction.pvc import (
     _cluster_power_sphere,
     _solve_sphere,
     _ylm_azimuth_zero,
+    order_parameter,
     pair_vector_marks,
 )
 
@@ -172,6 +173,31 @@ def test_split_counts_removes_shot_noise_bias():
         for split in (False, True)
     ]
     assert bias[0] > 0 and abs(bias[1]) < 0.1 * bias[0], bias
+
+
+def test_order_parameter_removes_noise_bias():
+    """Eight groups share a map that correlates about 0.6 with the reference, each
+    with independent noise three times its amplitude. The correlation of their
+    average is biased low by the noise; order_parameter recovers the true value
+    inside its confidence interval."""
+    rng = np.random.default_rng(0)
+    r, theta = np.arange(0, 4.05, 0.1), np.arange(0, 181.0)
+    reference = rng.normal(size=(r.size, r.size, theta.size))
+    signal = 0.6 * reference + 0.8 * rng.normal(size=reference.shape)
+    groups = signal + 3.0 * rng.normal(size=(8, *reference.shape))
+    omega = order_parameter(groups, reference, r, theta, r_range=(2.0, 4.0))
+
+    r_eff, ang = np.maximum.outer(r, r), (theta >= 15) & (theta <= 165)
+    truth, naive = [], []
+    for lo in np.arange(2.0, 4.0, 0.5):
+        inside = (r_eff >= lo) & (r_eff < lo + 0.5)
+        c = reference[inside][:, ang].ravel()
+        truth.append(np.corrcoef(signal[inside][:, ang].ravel(), c)[0, 1])
+        naive.append(np.corrcoef(groups.mean(0)[inside][:, ang].ravel(), c)[0, 1])
+    truth, naive = np.mean(truth), np.mean(naive)
+    assert omega.interval[0] <= truth <= omega.interval[1], (omega.value, omega.interval, truth)
+    assert abs(omega.value - truth) < 0.02, (omega.value, truth)
+    assert naive < truth - 0.1, (naive, truth)
 
 
 def test_self_term_removal(triangular):

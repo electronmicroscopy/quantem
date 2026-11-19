@@ -42,6 +42,11 @@ plot_correlation can add it back. The mean pattern holds the same two-body
 information (pair_distribution). A Gaussian damping of the radial weight keeps
 the ringing of sharp features below 1%.
 
+order_parameter measures how much of the angular order of a reference
+structure, usually the crystal of the same material, a sample keeps over
+distance: Omega is 1 for the reference and near 0 for a liquid. Its noise bias
+and confidence interval come from independent groups of patterns.
+
 The radial detector coordinate is |q| (1/A, no 2 pi). On the Ewald sphere the
 scattering vector makes the polar angle beta = 90 deg + asin(lambda |q| / 2)
 with the beam. With the spherical harmonic coefficients I_lm(q) of the 3D
@@ -60,13 +65,14 @@ volume squared and per unit cos(theta), so it carries no |sin(theta)| factor.
 """
 
 import warnings
+from typing import NamedTuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from matplotlib.patches import Circle
 from matplotlib.transforms import ScaledTranslation
-from scipy.special import jv, spherical_jn
+from scipy.special import jv, spherical_jn, stdtrit
 
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.datastructures.polar4dstem import Polar4dstem
@@ -811,6 +817,121 @@ def pair_vector_marks(
             if 5 <= deg <= theta_max - 5 and not same_shell_reverse:
                 marks.append((round(float(shell_r[s]), 2), float(deg)))
     return marks
+
+
+class OrderParameter(NamedTuple):
+    """Result of order_parameter: Omega, its standard error and confidence
+    interval, and the bias-corrected correlation (profile) in each r_eff bin."""
+
+    value: float
+    standard_error: float
+    interval: tuple[float, float]
+    r_eff: np.ndarray
+    profile: np.ndarray
+
+
+def order_parameter(
+    Theta_groups,
+    Theta_reference,
+    r,
+    theta_deg,
+    r_range: tuple[float, float] = (2.0, 10.0),
+    r_bin: float = 0.5,
+    theta_range: tuple[float, float] = (15.0, 165.0),
+    confidence: float = 0.95,
+) -> OrderParameter:
+    """
+    Order parameter Omega of a sample relative to a reference structure, usually
+    the perfect crystal of the same material, with a confidence interval.
+
+    In each bin of r_eff = max(r, r'), Omega compares the shape of the sample's
+    pair vector correlation with the reference's: the correlation coefficient of
+    the two maps over (r, r', theta), with theta in theta_range to leave out the
+    self term. Omega is the mean over the bins. It is 1 when the angular order of
+    the reference persists over the whole range, and near 0 when the sample has
+    no angular order beyond the shortest distances.
+
+    Noise adds power to the sample's map but does not correlate with the
+    reference, so the correlation of a single map is biased toward 0. The
+    patterns are therefore split into K independent groups, for example
+    contiguous blocks of the scan larger than the grain size, each solved by
+    correlation() with the same settings. The squared norm of the sample's
+    correlation is estimated from the products of different groups, whose noise
+    is independent, which removes the bias. Leaving out one group at a time
+    (jackknife) gives the standard error, and the interval uses Student's t with
+    K - 1 degrees of freedom, clipped to [-1, 1]. A wide interval means that the
+    groups disagree: the data cannot measure Omega at that dose and number of
+    patterns.
+
+    Theta_groups : sequence of K >= 3 arrays (Nr, Nr, Ntheta), one per group.
+    Theta_reference : array (Nr, Nr, Ntheta) of the reference on the same grid,
+        free of noise and processed like the data: model_correlation of the
+        reference structure, or correlation() of patterns simulated with the
+        probe and partial coherence of the experiment.
+    r, theta_deg : grids of the maps, the r and theta_deg of correlation().
+    r_range, r_bin : bins of r_eff (A).
+    theta_range : angles (deg) that enter.
+    confidence : of the interval.
+
+    Example, with 16 blocks of a 256 x 256 scan ds:
+
+        blocks = [ds[i : i + 64, j : j + 64] for i in range(0, 256, 64) for j in range(0, 256, 64)]
+        groups = [PairVectorCorrelation(b, fq=f, k_min=0.1) for b in blocks]
+        maps = [g.correlation("sphere", r_max=10.0)[1] for g in groups]
+        reference = groups[0].model_correlation(crystal_clusters)
+        omega = order_parameter(maps, reference, groups[0].r, groups[0].theta_deg)
+    """
+    G = torch.as_tensor(np.stack([np.asarray(T) for T in Theta_groups]), dtype=torch.float64)
+    C = torch.as_tensor(np.asarray(Theta_reference), dtype=torch.float64)
+    K = G.shape[0]
+    if K < 3:
+        raise ValueError(f"order_parameter needs at least 3 groups, got {K}")
+    if G.shape[1:] != C.shape:
+        raise ValueError(f"group maps {tuple(G.shape[1:])} and reference {tuple(C.shape)} differ")
+    theta = torch.as_tensor(np.asarray(theta_deg), dtype=torch.float64)
+    keep = (theta >= theta_range[0]) & (theta <= theta_range[1])
+    G, C = G[..., keep], C[..., keep]
+    r = torch.as_tensor(np.asarray(r), dtype=torch.float64)
+    r_eff = torch.maximum(r[:, None], r[None, :])
+    n_bins = int(round((r_range[1] - r_range[0]) / r_bin))
+    edges = r_range[0] + r_bin * np.arange(n_bins + 1)
+
+    # per bin: products of the centered group maps with each other and with the reference
+    stats, centers = [], []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        inside = (r_eff >= lo) & (r_eff < hi)
+        c = C[inside].reshape(-1)
+        c = c - c.mean()
+        if c @ c == 0:
+            continue
+        g = G[:, inside].reshape(K, -1)
+        g = g - g.mean(1, keepdim=True)
+        stats.append((g @ g.T, g @ c, c @ c))
+        centers.append(0.5 * (lo + hi))
+    if not stats:
+        raise ValueError("no r_eff bin of r_range holds reference structure")
+
+    def profile(w):
+        """Correlation per bin from the groups with weights w (0 leaves a group out)."""
+        W = torch.outer(w, w)
+        W.fill_diagonal_(0.0)  # products of different groups only
+        out = []
+        for M, v, cc in stats:
+            num = w @ v / w.sum()  # <signal, reference>: noise averages out
+            norm = (W * M).sum() / W.sum()  # |signal|^2 without the noise power
+            den = torch.sqrt(cc * torch.clamp(norm, min=num**2 / cc))  # |correlation| <= 1
+            out.append(num / den if den > 0 else torch.zeros((), dtype=torch.float64))
+        return torch.stack(out)
+
+    full = profile(torch.ones(K, dtype=torch.float64))
+    value = float(full.mean())
+    jack = torch.stack(
+        [profile((torch.arange(K) != i).to(torch.float64)).mean() for i in range(K)]
+    )
+    se = float(torch.sqrt((K - 1) / K * ((jack - jack.mean()) ** 2).sum()))
+    t = float(stdtrit(K - 1, 0.5 + 0.5 * confidence))
+    interval = (max(value - t * se, -1.0), min(value + t * se, 1.0))
+    return OrderParameter(value, se, interval, np.array(centers), full.numpy())
 
 
 # ---------------------------------------------------------------------- helpers
