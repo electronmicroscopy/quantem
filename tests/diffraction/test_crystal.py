@@ -151,6 +151,8 @@ def test_wedge_is_fundamental_domain(label, spacegroup, symbols, basis, cellpar,
     atoms = ase_crystal(symbols, basis=basis, spacegroup=spacegroup, cellpar=cellpar)
     xtl = Crystal.from_ase(atoms, name=label, verbose=False)
     assert xtl.laue_group_matching == laue
+    # no ase objects inside Crystal, and the caller's structure keeps its own
+    assert "spacegroup" not in xtl.atoms.info and "spacegroup" in atoms.info
     # exactly one symmetry image of every direction lies in the wedge: the
     # wedge covers all of orientation space once (the -3m1 setting used to
     # get a wedge rotated by 30 degrees, covering half the directions twice)
