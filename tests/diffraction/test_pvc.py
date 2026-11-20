@@ -203,17 +203,20 @@ def test_order_parameter_removes_noise_bias():
 def test_self_term_removal(triangular):
     """Theta leaves out the correlation of each pair vector with itself at 0 deg
     on r = r', which Theta_self holds, in both rotation models, and the fitted
-    amplitude peaks at the bond length. The projected pair distribution of the mean
+    amplitude peaks at the bond length. A single pattern has no fluctuation
+    part, so the sphere model uses the total second moment. The projected pair distribution of the mean
     pattern, which holds that two-body information instead, matches the atom
     positions (one projection has no 3D pair distribution), and its first
     neighbor shell holds the bond length and stops short of the next shell."""
     intensity, positions = triangular
     pvc = _pvc(intensity, (N_PX // 2, N_PX // 2))
+    with pytest.raises(ValueError, match="more than one pattern"):
+        pvc.correlation("sphere", part="fluctuation")
     for model in ("beam", "sphere"):
         _, T = pvc.correlation(model, r_max=4.0)
         i = int(np.argmin(np.abs(pvc.r - BOND)))
         spike = [abs(V[i, i, 0]) / np.abs(V[i, i, 30:150]).max() for V in (T + pvc.Theta_self, T)]
-        assert spike[0] > 0.9 and spike[1] < 0.3, (model, spike)
+        assert spike[0] > 0.9 and spike[1] < 0.4, (model, spike)
         u, h = pvc.self_amplitude
         assert abs(u[np.argmax(h.sum(0))] - BOND) <= 0.1, model
         if model == "beam":

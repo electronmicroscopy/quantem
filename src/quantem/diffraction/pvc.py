@@ -277,6 +277,11 @@ class PairVectorCorrelation:
         if part == "mean":
             return mean
         if part == "fluctuation":
+            if self.n_patterns == 1:
+                raise ValueError(
+                    "the fluctuation part needs more than one pattern; for a single pattern "
+                    "it is zero apart from rounding, so use part='total'"
+                )
             return self.second_moment - mean
         raise ValueError(f"part must be 'total', 'mean' or 'fluctuation', got {part!r}")
 
@@ -309,7 +314,8 @@ class PairVectorCorrelation:
             dphi from 0 to 360 deg); see the module docstring.
         part : "total", "mean" or "fluctuation" second moment; by default
             "fluctuation" for the sphere model and "total" for the beam model,
-            which is often applied to single patterns.
+            which is often applied to single patterns, and for a single pattern,
+            whose fluctuation part is zero.
         l_max : largest (even) spherical harmonic order, for the sphere model.
         n_max : largest circular harmonic order, for the beam model.
         r_max, r_step : real-space grid (A), including r_max.
@@ -325,7 +331,8 @@ class PairVectorCorrelation:
         amplitude, which follows the pair distribution, in self_amplitude as
         (u, h).
         """
-        part = ("fluctuation" if model == "sphere" else "total") if part is None else part
+        if part is None:
+            part = "fluctuation" if model == "sphere" and self.n_patterns > 1 else "total"
         self.r = np.arange(0, r_max + 0.5 * r_step, r_step)
         self.model, self.part, self.order_taper = model, part, order_taper
         S = self._part(part)
