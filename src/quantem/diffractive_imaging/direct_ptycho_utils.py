@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from quantem.core import config
+from quantem.core.io.serialize import AutoSerialize
 
 if TYPE_CHECKING:
     import torch
@@ -1251,7 +1252,7 @@ def build_vbf_stack_from_dataset3d(
 
 
 @dataclass
-class EventStack:
+class EventStack(AutoSerialize):
     """
     Detected electrons as a flat table, sorted by bright-field pixel.
 

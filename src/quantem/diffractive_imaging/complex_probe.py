@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from numpy.typing import NDArray
 
+from quantem.core.io.serialize import AutoSerialize
 from quantem.core.utils.utils import electron_wavelength_angstrom
 
 # fmt: off
@@ -309,7 +310,7 @@ def aberration_surface_cartesian_gradients(
     return dchi_dx, dchi_dy
 
 
-class FourierProbe:
+class FourierProbe(AutoSerialize):
     """``psi(k)``, the probe in the detector plane, sampled wherever ``gamma_factor`` needs it.
 
     Two flavours behind one interface:

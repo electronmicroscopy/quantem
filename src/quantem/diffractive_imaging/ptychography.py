@@ -141,6 +141,28 @@ def _ddp_ptycho_worker(
             dist.destroy_process_group()
 
 
+def _continue_dataset_training(dset: DatasetModelType, metadata: dict[str, Any]) -> None:
+    """Restore the learned scan positions and descan shifts saved in `metadata`
+    onto a reloaded or new dataset, with the optimizer and scheduler learning them."""
+    if "learned_scan_positions_px" in metadata:
+        dset.scan_positions_px.data = metadata["learned_scan_positions_px"]  # type: ignore[assignment]
+    if "learned_descan_shifts" in metadata:
+        dset.descan_shifts.data = metadata["learned_descan_shifts"]  # type: ignore[assignment]
+    if "learn_scan_positions" in metadata:  # older files did not store the rest
+        dset.learn_scan_positions = metadata["learn_scan_positions"]
+        dset.learn_descan = metadata["learn_descan"]
+    if metadata.get("optimizer_state") is None:
+        return
+    # built as reconstruct builds them; the scheduler before the optimizer's state is
+    # loaded, since building a scheduler sets the learning rate
+    dset.set_optimizer(metadata["optimizer_params"])
+    dset.set_scheduler(metadata["scheduler_params"])
+    if dset.optimizer is not None:
+        dset.optimizer.load_state_dict(metadata["optimizer_state"])
+    if dset.scheduler is not None and metadata["scheduler_state"] is not None:
+        dset.scheduler.load_state_dict(metadata["scheduler_state"])
+
+
 class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase):  # pyright: ignore[reportUnsafeMultipleInheritance]
     """
     A class for performing phase retrieval using the Ptychography algorithm.
@@ -847,7 +869,9 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         compression_level : int | None
             Compression level for zip storage
         save_raw_data : bool
-            Whether to save the raw dataset data (default: False)
+            Whether to save the raw dataset data (default: False). Without it,
+            `from_file` reloads the data from its file and keeps the learned scan
+            positions and descan shifts and the optimizer state for them.
 
         Examples
         --------
@@ -883,12 +907,24 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                 ]
             )
 
-            # Save dataset metadata for automatic reloading
+            # Save dataset metadata for automatic reloading, with the learned scan
+            # positions and descan shifts and the optimizer and scheduler learning them
+            dset = self.dset
             self._dataset_metadata = {
-                "file_path": str(self.dset.dset.file_path) if self.dset.dset.file_path else None,
-                "preprocessing_params": self.dset._preprocessing_params,
-                "learned_scan_positions_px": self.dset.scan_positions_px.data.cpu(),
-                "learned_descan_shifts": self.dset.descan_shifts.data.cpu(),
+                "file_path": str(dset.dset.file_path) if dset.dset.file_path else None,
+                "preprocessing_params": dset._preprocessing_params,
+                "learned_scan_positions_px": dset.scan_positions_px.data.cpu(),
+                "learned_descan_shifts": dset.descan_shifts.data.cpu(),
+                "learn_scan_positions": dset.learn_scan_positions,
+                "learn_descan": dset.learn_descan,
+                "optimizer_params": dset.optimizer_params,
+                "scheduler_params": dset.scheduler_params,
+                "optimizer_state": (
+                    dset.optimizer.state_dict() if dset.optimizer is not None else None
+                ),
+                "scheduler_state": (
+                    dset.scheduler.state_dict() if dset.scheduler is not None else None
+                ),
             }
 
         # Add other common skips for ptychography objects
@@ -923,6 +959,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         device: str | int | None = None,
         verbose: int | bool | None = None,
         auto_reload_dataset: bool = True,
+        allow_pickle: bool = False,
     ):
         """
         Load a ptychography object from a saved file.
@@ -939,6 +976,10 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             Verbosity level
         auto_reload_dataset : bool
             Whether to automatically reload and preprocess the dataset from saved metadata
+        allow_pickle : bool
+            Also load values that can run code; see `quantem.core.io.load`.
+            Needed only for files written by older quantem versions, which
+            pickled the models, or for models defined outside quantem and torch.
 
         Returns
         -------
@@ -946,7 +987,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             Loaded ptychography object
         """
         # Load the base object without the dataset
-        ptycho = cls._recursive_load_from_path(path)
+        ptycho = cls._recursive_load_from_path(path, allow_pickle=allow_pickle)
 
         if not isinstance(ptycho, Ptychography):
             raise ValueError("Loaded object is not a Ptychography object")
@@ -996,16 +1037,11 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         elif dset is not None:
             dset._set_initial_scan_positions_px(ptycho.obj_padding_px)
             dset._set_patch_indices(ptycho.obj_padding_px)
-            if ptycho._dataset_metadata is not None:
-                metadata = ptycho._dataset_metadata
-                # preserve learned scan positions and descan shifts
-                if "learned_scan_positions_px" in metadata:
-                    dset.scan_positions_px.data = metadata["learned_scan_positions_px"]  # type: ignore[assignment]
-                if "learned_descan_shifts" in metadata:
-                    dset.descan_shifts.data = metadata["learned_descan_shifts"]  # type: ignore[assignment]
 
         # check if dset was attached to ptycho object
         if dset is not None:
+            if ptycho._dataset_metadata is not None:
+                _continue_dataset_training(dset, ptycho._dataset_metadata)
             ptycho.dset = dset
         elif not (hasattr(ptycho, "_dset") and ptycho._dset is not None):
             warn(
@@ -1027,9 +1063,9 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         return ptycho
 
     @classmethod
-    def _recursive_load_from_path(cls, path: str | Path):
+    def _recursive_load_from_path(cls, path: str | Path, allow_pickle: bool = False):
         """Helper method to load an object from a path using AutoSerialize."""
-        return autoserialize_load(path)
+        return autoserialize_load(path, allow_pickle=allow_pickle)
 
     def clone(self, device: str | int = "cpu") -> Self:  # TODO make this faster
         """

@@ -2244,10 +2244,10 @@ class ObjectTensorDecomp(ObjectINR):
 
     Notes
     -----
-    - The ``density_activation`` must be a picklable ``nn.Module`` (``nn.Identity`` for
-      ``pure_phase``, ``nn.Softplus`` for ``potential``); a bare lambda will break ``save()``
-      because AutoSerialize pickles the whole module. ``from_uniform`` sets this automatically;
-      ``from_model`` warns otherwise.
+    - The ``density_activation`` should be an ``nn.Module`` (``nn.Identity`` for ``pure_phase``,
+      ``nn.Softplus`` for ``potential``) or a module-level function. A lambda is pickled, so
+      the saved file loads only with ``allow_pickle=True``. ``from_uniform`` sets this
+      automatically; ``from_model`` warns otherwise.
     - K-Planes converge from scratch, but ``from_pixelated`` + ``pretrain`` can still warm-start
       the grid to a pixelated reconstruction (cheap, useful for finding hyperparameters quickly).
     """
@@ -2275,12 +2275,12 @@ class ObjectTensorDecomp(ObjectINR):
                 f"model must be a KPlanes/KPlanesTILTED/CPTilted instance, got {type(model)}"
             )
         activation = getattr(model, "density_activation", None)
-        if activation is not None and not isinstance(activation, nn.Module):
+        if "<" in getattr(activation, "__qualname__", ""):  # <lambda>, or <locals>
             warn(
-                "KPlanes.density_activation is a plain callable (e.g. a lambda); saving this "
-                "object will fail because AutoSerialize pickles the whole module. Use an "
+                "KPlanes.density_activation is a lambda or a function defined in a function; "
+                "a saved reconstruction will load only with allow_pickle=True. Use an "
                 "nn.Module activation (nn.Identity for pure_phase, nn.Softplus for potential), "
-                "e.g. via ObjectTensorDecomp.from_uniform.",
+                "e.g. via ObjectTensorDecomp.from_uniform, or a module-level function.",
                 stacklevel=2,
             )
         obj = cls(
