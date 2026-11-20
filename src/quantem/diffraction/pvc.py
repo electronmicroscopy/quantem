@@ -845,6 +845,7 @@ def order_parameter(
     r_range: tuple[float, float] = (2.0, 10.0),
     r_bin: float = 0.5,
     theta_range: tuple[float, float] = (15.0, 165.0),
+    min_structure: float = 0.2,
     confidence: float = 0.95,
 ) -> OrderParameter:
     """
@@ -857,6 +858,13 @@ def order_parameter(
     self term. Omega is the mean over the bins. It is 1 when the angular order of
     the reference persists over the whole range, and near 0 when the sample has
     no angular order beyond the shortest distances.
+
+    The correlation coefficient ignores amplitude, so a bin in which the
+    reference is nearly flat would count as much as any other, while its value
+    is set by small residuals. Bins whose reference RMS is below min_structure
+    times the median over the bins are left out. Crystalline Si, for example,
+    has no pair vectors between 2.35 and 3.84 A, and its bin from 3.0 to 3.5 A
+    holds only the tails of the neighboring shells, below 0.1 of the median.
 
     Noise adds power to the sample's map but does not correlate with the
     reference, so the correlation of a single map is biased toward 0. The
@@ -878,6 +886,7 @@ def order_parameter(
     r, theta_deg : grids of the maps, the r and theta_deg of correlation().
     r_range, r_bin : bins of r_eff (A).
     theta_range : angles (deg) that enter.
+    min_structure : smallest reference RMS of a bin, relative to the median bin.
     confidence : of the interval.
 
     Example, with 16 blocks of a 256 x 256 scan ds:
@@ -903,20 +912,25 @@ def order_parameter(
     n_bins = int(round((r_range[1] - r_range[0]) / r_bin))
     edges = r_range[0] + r_bin * np.arange(n_bins + 1)
 
+    bins = [(r_eff >= lo) & (r_eff < hi) for lo, hi in zip(edges[:-1], edges[1:])]
+    rms = torch.stack(
+        [C[inside].std(correction=0) if inside.any() else torch.zeros(()) for inside in bins]
+    )
+    if not (rms > 0).any():
+        raise ValueError("no r_eff bin of r_range holds reference structure")
+    enough = (rms > 0) & (rms >= min_structure * rms[rms > 0].median())
+
     # per bin: products of the centered group maps with each other and with the reference
     stats, centers = [], []
-    for lo, hi in zip(edges[:-1], edges[1:]):
-        inside = (r_eff >= lo) & (r_eff < hi)
+    for inside, lo, use in zip(bins, edges[:-1], enough):
+        if not use:
+            continue
         c = C[inside].reshape(-1)
         c = c - c.mean()
-        if c @ c == 0:
-            continue
         g = G[:, inside].reshape(K, -1)
         g = g - g.mean(1, keepdim=True)
         stats.append((g @ g.T, g @ c, c @ c))
-        centers.append(0.5 * (lo + hi))
-    if not stats:
-        raise ValueError("no r_eff bin of r_range holds reference structure")
+        centers.append(lo + 0.5 * r_bin)
 
     def profile(w):
         """Correlation per bin from the groups with weights w (0 leaves a group out)."""

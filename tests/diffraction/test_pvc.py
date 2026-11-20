@@ -179,17 +179,20 @@ def test_order_parameter_removes_noise_bias():
     """Eight groups share a map that correlates about 0.6 with the reference, each
     with independent noise three times its amplitude. The correlation of their
     average is biased low by the noise; order_parameter recovers the true value
-    inside its confidence interval."""
+    inside its confidence interval. The bin from 3.0 to 3.5 A, where the reference
+    is nearly flat and the signal does not follow it, is left out."""
     rng = np.random.default_rng(0)
     r, theta = np.arange(0, 4.05, 0.1), np.arange(0, 181.0)
     reference = rng.normal(size=(r.size, r.size, theta.size))
+    r_eff, ang = np.maximum.outer(r, r), (theta >= 15) & (theta <= 165)
+    reference[(r_eff >= 3.0) & (r_eff < 3.5)] *= 0.01
     signal = 0.6 * reference + 0.8 * rng.normal(size=reference.shape)
     groups = signal + 3.0 * rng.normal(size=(8, *reference.shape))
     omega = order_parameter(groups, reference, r, theta, r_range=(2.0, 4.0))
+    assert np.allclose(omega.r_eff, [2.25, 2.75, 3.75]), omega.r_eff
 
-    r_eff, ang = np.maximum.outer(r, r), (theta >= 15) & (theta <= 165)
     truth, naive = [], []
-    for lo in np.arange(2.0, 4.0, 0.5):
+    for lo in (2.0, 2.5, 3.5):
         inside = (r_eff >= lo) & (r_eff < lo + 0.5)
         c = reference[inside][:, ang].ravel()
         truth.append(np.corrcoef(signal[inside][:, ang].ravel(), c)[0, 1])
