@@ -844,7 +844,6 @@ def order_parameter(
     theta_deg,
     r_range: tuple[float, float] = (2.0, 10.0),
     r_bin: float = 0.5,
-    theta_range: tuple[float, float] = (15.0, 165.0),
     min_structure: float = 0.2,
     confidence: float = 0.95,
 ) -> OrderParameter:
@@ -854,10 +853,13 @@ def order_parameter(
 
     In each bin of r_eff = max(r, r'), Omega compares the shape of the sample's
     pair vector correlation with the reference's: the correlation coefficient of
-    the two maps over (r, r', theta), with theta in theta_range to leave out the
-    self term. Omega is the mean over the bins. It is 1 when the angular order of
-    the reference persists over the whole range, and near 0 when the sample has
-    no angular order beyond the shortest distances.
+    the two maps over (r, r', theta). Theta is a density per unit solid angle,
+    so each angle is weighted by its solid angle, sin(theta); on a uniform grid
+    in theta, the few pair vectors near 0 and 180 deg would otherwise count as
+    much as the many near 90 deg. Maps of the beam model, with dphi from 0 to
+    360 deg, are weighted uniformly. Omega is the mean over the bins. It is 1
+    when the angular order of the reference persists over the whole range, and
+    near 0 when the sample has no angular order beyond the shortest distances.
 
     The correlation coefficient ignores amplitude, so a bin in which the
     reference is nearly flat would count as much as any other, while its value
@@ -885,7 +887,6 @@ def order_parameter(
         probe and partial coherence of the experiment.
     r, theta_deg : grids of the maps, the r and theta_deg of correlation().
     r_range, r_bin : bins of r_eff (A).
-    theta_range : angles (deg) that enter.
     min_structure : smallest reference RMS of a bin, relative to the median bin.
     confidence : of the interval.
 
@@ -905,8 +906,17 @@ def order_parameter(
     if G.shape[1:] != C.shape:
         raise ValueError(f"group maps {tuple(G.shape[1:])} and reference {tuple(C.shape)} differ")
     theta = torch.as_tensor(np.asarray(theta_deg), dtype=torch.float64)
-    keep = (theta >= theta_range[0]) & (theta <= theta_range[1])
-    G, C = G[..., keep], C[..., keep]
+    if theta.max() <= 180:
+        weight = torch.sin(torch.deg2rad(theta)).clamp(min=0)  # solid angle on the sphere
+    else:
+        weight = torch.ones_like(theta)  # angles around the beam
+    root = torch.sqrt(weight / weight.mean())
+
+    def centered(x):
+        """Values of one bin (..., n, Ntheta) minus their weighted mean, times sqrt(weight)."""
+        mean = (x * weight).sum((-2, -1), keepdim=True) / (weight.sum() * x.shape[-2])
+        return (x - mean) * root
+
     r = torch.as_tensor(np.asarray(r), dtype=torch.float64)
     r_eff = torch.maximum(r[:, None], r[None, :])
     n_bins = int(round((r_range[1] - r_range[0]) / r_bin))
@@ -914,7 +924,10 @@ def order_parameter(
 
     bins = [(r_eff >= lo) & (r_eff < hi) for lo, hi in zip(edges[:-1], edges[1:])]
     rms = torch.stack(
-        [C[inside].std(correction=0) if inside.any() else torch.zeros(()) for inside in bins]
+        [
+            centered(C[inside]).pow(2).mean().sqrt() if inside.any() else torch.zeros(())
+            for inside in bins
+        ]
     )
     if not (rms > 0).any():
         raise ValueError("no r_eff bin of r_range holds reference structure")
@@ -925,10 +938,8 @@ def order_parameter(
     for inside, lo, use in zip(bins, edges[:-1], enough):
         if not use:
             continue
-        c = C[inside].reshape(-1)
-        c = c - c.mean()
-        g = G[:, inside].reshape(K, -1)
-        g = g - g.mean(1, keepdim=True)
+        c = centered(C[inside]).reshape(-1)
+        g = centered(G[:, inside]).reshape(K, -1)
         stats.append((g @ g.T, g @ c, c @ c))
         centers.append(lo + 0.5 * r_bin)
 

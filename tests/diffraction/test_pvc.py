@@ -184,19 +184,24 @@ def test_order_parameter_removes_noise_bias():
     rng = np.random.default_rng(0)
     r, theta = np.arange(0, 4.05, 0.1), np.arange(0, 181.0)
     reference = rng.normal(size=(r.size, r.size, theta.size))
-    r_eff, ang = np.maximum.outer(r, r), (theta >= 15) & (theta <= 165)
+    r_eff, weight = np.maximum.outer(r, r), np.sin(np.deg2rad(theta))
     reference[(r_eff >= 3.0) & (r_eff < 3.5)] *= 0.01
     signal = 0.6 * reference + 0.8 * rng.normal(size=reference.shape)
     groups = signal + 3.0 * rng.normal(size=(8, *reference.shape))
     omega = order_parameter(groups, reference, r, theta, r_range=(2.0, 4.0))
     assert np.allclose(omega.r_eff, [2.25, 2.75, 3.75]), omega.r_eff
 
+    def corr(x, c):
+        """Correlation coefficient with each angle weighted by its solid angle."""
+        w = np.broadcast_to(weight, x.shape)
+        x, c = x - np.average(x, weights=w), c - np.average(c, weights=w)
+        return (w * x * c).sum() / np.sqrt((w * x * x).sum() * (w * c * c).sum())
+
     truth, naive = [], []
     for lo in (2.0, 2.5, 3.5):
         inside = (r_eff >= lo) & (r_eff < lo + 0.5)
-        c = reference[inside][:, ang].ravel()
-        truth.append(np.corrcoef(signal[inside][:, ang].ravel(), c)[0, 1])
-        naive.append(np.corrcoef(groups.mean(0)[inside][:, ang].ravel(), c)[0, 1])
+        truth.append(corr(signal[inside], reference[inside]))
+        naive.append(corr(groups.mean(0)[inside], reference[inside]))
     truth, naive = np.mean(truth), np.mean(naive)
     assert omega.interval[0] <= truth <= omega.interval[1], (omega.value, omega.interval, truth)
     assert abs(omega.value - truth) < 0.02, (omega.value, truth)
