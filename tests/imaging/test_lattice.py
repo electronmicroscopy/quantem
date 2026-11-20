@@ -345,7 +345,7 @@ class TestLatticeAtoms:
             contrast_min=0.2,
             annulus_radii=(5, 10),
         ).refine_atoms(
-            fit_radius=12.0,
+            fit_radius=8.0,
             max_nfev=250,
             max_move_px=5.0,
         )
@@ -372,7 +372,7 @@ class TestLatticeAtoms:
             contrast_min=0.2,
             annulus_radii=(5, 10),
             refine_atoms=True,
-            fit_radius=12.0,
+            fit_radius=8.0,
             max_nfev=250,
             max_move_px=5.0,
         )
