@@ -365,7 +365,16 @@ class Crystal(AutoSerialize):
         pseudo_symmetry_intensity_tol: float = 0.05,
         verbose: bool = True,
     ):
-        self.atoms = atoms
+        # a copy without the ase Spacegroup object that ase's CIF reader and
+        # ase.spacegroup.crystal add: Crystal finds the space group itself
+        # (Crystal.spacegroup), so we keep only native data. Built from the
+        # arrays, since atoms.copy() sets an array shape, deprecated in NumPy.
+        self.atoms = Atoms(
+            numbers=atoms.numbers, positions=atoms.positions, cell=atoms.cell, pbc=atoms.pbc
+        )
+        for key, values in atoms.arrays.items():  # occupancy, tags, ...
+            self.atoms.arrays[key] = values.copy()
+        self.atoms.info = {k: v for k, v in atoms.info.items() if k != "spacegroup"}
         self.name = name if name is not None else atoms.get_chemical_formula()
         self._pseudo_symmetry_tol = pseudo_symmetry_tol
         self._pseudo_symmetry_intensity_tol = float(pseudo_symmetry_intensity_tol)
