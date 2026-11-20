@@ -1,342 +1,317 @@
-"""Orientation histograms and flowline rendering.
+"""Radial peak families, orientation histograms and flowline maps.
 
-Turns detected peaks into a per-position map of scattering direction, then traces
-and renders that as flowlines. Applies to any material with anisotropic
-scattering -- fibres, liquid crystals, crystalline texture -- not just
-semi-crystalline polymers.
+Works on calibrated polar peaks, a :class:`~quantem.core.datastructures.Vector`
+with fields ``(q, theta, intensity)`` such as
+:meth:`~quantem.diffraction.polymer.BraggPeaksPolymer.polar_peaks` returns, so it
+applies to any material with anisotropic scattering, not only polymers. The
+pipeline is::
 
-The pipeline is: peaks -> ``make_orientation_histogram`` -> ``make_flowline_map``
--> ``make_flowline_rainbow_image`` (or ``make_flowline_combined_image``), with
-``make_flowline_rainbow_legend`` for the colour key.
+    centers, windows, _ = estimate_peak_windows(peaks)
+    hist = make_orientation_histogram(peaks, windows)
+    flow = make_flowline_map(hist)
+    image = make_flowline_rainbow_image(flow)
 
-``BraggPeaksPolymer`` keeps same-named methods forwarding to these.
+Orientations are pi-periodic. The histogram axes are (radial window, scan row,
+scan col, theta), with theta the scattering direction measured from the scan
+column axis towards +row; flowlines run perpendicular to it.
 """
 
 from __future__ import annotations
 
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
+import torch.nn.functional as F
 from matplotlib.colors import hsv_to_rgb, rgb_to_hsv
-from scipy.ndimage import gaussian_filter1d
-from tqdm import tqdm
+from scipy.signal import find_peaks, peak_widths
+from tqdm.auto import tqdm
 
-from quantem.core.utils.utils import tqdmnd
-from quantem.diffraction.vector_fields import vector_field_cell
+from quantem.core.datastructures.vector import Vector
+from quantem.core.visualization import show_2d
 
 __all__ = [
-    "make_flowline_combined_image",
+    "estimate_peak_windows",
+    "radial_profile",
+    "plot_radial_profile",
+    "peak_maps",
+    "make_orientation_histogram",
     "make_flowline_map",
     "make_flowline_rainbow_image",
     "make_flowline_rainbow_legend",
-    "make_orientation_histogram",
+    "make_flowline_combined_image",
 ]
 
 
-def _get_intensity(orient, x, y, t):
-    # utility function to get histogram intensites
-
-    x = np.clip(x, 0, orient.shape[0] - 2)
-    y = np.clip(y, 0, orient.shape[1] - 2)
-
-    xF = np.floor(x).astype("int")
-    yF = np.floor(y).astype("int")
-    tF = np.floor(t).astype("int")
-    dx = x - xF
-    dy = y - yF
-    dt = t - tF
-    t1 = np.mod(tF, orient.shape[2])
-    t2 = np.mod(tF + 1, orient.shape[2])
-
-    int_vals = (
-        orient[xF, yF, t1] * ((1 - dx) * (1 - dy) * (1 - dt))
-        + orient[xF, yF, t2] * ((1 - dx) * (1 - dy) * (dt))
-        + orient[xF, yF + 1, t1] * ((1 - dx) * (dy) * (1 - dt))
-        + orient[xF, yF + 1, t2] * ((1 - dx) * (dy) * (dt))
-        + orient[xF + 1, yF, t1] * ((dx) * (1 - dy) * (1 - dt))
-        + orient[xF + 1, yF, t2] * ((dx) * (1 - dy) * (dt))
-        + orient[xF + 1, yF + 1, t1] * ((dx) * (dy) * (1 - dt))
-        + orient[xF + 1, yF + 1, t2] * ((dx) * (dy) * (dt))
-    )
-
-    return int_vals
+def _flat(peaks: Vector) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``(q, theta, intensity)`` columns and the scan (row, col) of every peak."""
+    data = peaks.select_fields("q", "theta", "intensity").numpy().astype(np.float64)
+    cell = np.repeat(np.arange(int(np.prod(peaks.shape))), peaks.row_counts())
+    return data, cell // peaks.shape[1], cell % peaks.shape[1]
 
 
-def _set_intensity(orient, xy_t_int):
-    # utility function to set flowline intensites
-
-    xF = np.floor(xy_t_int[:, 0]).astype("int")
-    yF = np.floor(xy_t_int[:, 1]).astype("int")
-    tF = np.floor(xy_t_int[:, 2]).astype("int")
-    dx = xy_t_int[:, 0] - xF
-    dy = xy_t_int[:, 1] - yF
-    dt = xy_t_int[:, 2] - tF
-
-    inds_1D = np.ravel_multi_index([xF, yF, tF], orient.shape[0:3], mode=["clip", "clip", "wrap"])
-    orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (1 - dx) * (1 - dy) * (
-        1 - dt
-    )
-    inds_1D = np.ravel_multi_index(
-        [xF, yF, tF + 1], orient.shape[0:3], mode=["clip", "clip", "wrap"]
-    )
-    orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (1 - dx) * (1 - dy) * (dt)
-    inds_1D = np.ravel_multi_index(
-        [xF, yF + 1, tF], orient.shape[0:3], mode=["clip", "clip", "wrap"]
-    )
-    orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (1 - dx) * (dy) * (1 - dt)
-    inds_1D = np.ravel_multi_index(
-        [xF, yF + 1, tF + 1], orient.shape[0:3], mode=["clip", "clip", "wrap"]
-    )
-    orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (1 - dx) * (dy) * (dt)
-    inds_1D = np.ravel_multi_index(
-        [xF + 1, yF, tF], orient.shape[0:3], mode=["clip", "clip", "wrap"]
-    )
-    orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (dx) * (1 - dy) * (1 - dt)
-    inds_1D = np.ravel_multi_index(
-        [xF + 1, yF, tF + 1], orient.shape[0:3], mode=["clip", "clip", "wrap"]
-    )
-    orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (dx) * (1 - dy) * (dt)
-    inds_1D = np.ravel_multi_index(
-        [xF + 1, yF + 1, tF], orient.shape[0:3], mode=["clip", "clip", "wrap"]
-    )
-    orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (dx) * (dy) * (1 - dt)
-    inds_1D = np.ravel_multi_index(
-        [xF + 1, yF + 1, tF + 1], orient.shape[0:3], mode=["clip", "clip", "wrap"]
-    )
-    orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (dx) * (dy) * (dt)
-
-    return orient
-
-
-def make_orientation_histogram(
-    polar_peaks,
-    peak_intensities,
-    radial_ranges: np.ndarray = None,
-    orientation_flip_sign: bool = False,
-    orientation_offset_degrees: float = 0.0,
-    upsample_factor: float = 4.0,
-    theta_step_deg: float = 1.0,
-    sigma_x: float = 1.0,
-    sigma_y: float = 1.0,
-    sigma_theta: float = 3.0,
-    use_peak_sigma: bool = False,
-    peak_sigma_samples: int = 6,
-    normalize_intensity_image: bool = False,
-    normalize_intensity_stack: bool = True,
-    progress_bar: bool = True,
-    r_field: str = "r_invA",
-    theta_field: str = "theta",
-    intensity_field: str = "intensities",
-    # intensity_field: str = "intensities_sampled_from_dp",
-):
-    """
-    Create a 4D orientation histogram from polar Bragg peaks, one histogram per radial range.
-
-    Parameters
-    ----------
-    radial_ranges : np.ndarray, optional
-        Size (N x 2) array for N radial bins, or (2,) for a single bin.
-    orientation_flip_sign : bool
-        Flip the direction of theta
-    orientation_offset_degrees : float
-        Offset for orientation angles in degrees
-    upsample_factor : float
-        Upsample factor for output histogram
-    theta_step_deg : float
-        Step size along annular direction in degrees
-    sigma_x : float
-        Smoothing in x direction before upsample
-    sigma_y : float
-        Smoothing in y direction before upsample
-    sigma_theta : float
-        Smoothing in annular direction (units of bins, periodic)
-    use_peak_sigma : bool
-        Spread signal along annular direction using measured peak width
-    peak_sigma_samples : int
-        Number of samples for peak sigma spreading
-    normalize_intensity_image : bool
-        Normalize to max peak intensity = 1, per image
-    normalize_intensity_stack : bool
-        Normalize to max peak intensity = 1, all images
-    progress_bar : bool
-        Enable progress bar
-    r_field : str
-        Name of radial coordinate field
-    theta_field : str
-        Name of angular coordinate field
-    intensity_field : str
-        Name of intensity field
+def radial_profile(peaks: Vector, num_bins=200, q_range=None, mode="intensity"):
+    """Peak intensity (or count) histogram over q.
 
     Returns
     -------
-    orient_hist : np.ndarray
-        4D array containing Bragg peak intensity histogram
-        [radial_bin, x_probe, y_probe, theta]
+    q_centers, profile : np.ndarray
     """
-    # Coordinates
-    theta = np.arange(0, 180, theta_step_deg) * np.pi / 180.0
-    dtheta = theta[1] - theta[0]
-    dtheta_deg = dtheta * 180 / np.pi
-    num_theta_bins = np.size(theta)
+    if mode not in ("intensity", "count"):
+        raise ValueError(f"mode must be 'intensity' or 'count', got {mode!r}")
+    data = _flat(peaks)[0]
+    q_min, q_max = (0.0, data[:, 0].max()) if q_range is None else q_range
+    edges = np.linspace(q_min, q_max, num_bins + 1)
+    weights = data[:, 2] if mode == "intensity" else None
+    profile, _ = np.histogram(data[:, 0], bins=edges, weights=weights)
+    return 0.5 * (edges[:-1] + edges[1:]), profile
 
-    # Setup for peak sigma spreading
-    if use_peak_sigma:
-        v_sigma = np.linspace(-2, 2, 2 * peak_sigma_samples + 1)
-        w_sigma = np.exp(-(v_sigma**2) / 2)
 
-    # Input bins
-    radial_ranges = np.array(radial_ranges)
-    if radial_ranges.ndim == 1:
-        radial_ranges = radial_ranges[None, :]
-    radial_ranges_2 = radial_ranges**2
-    num_radii = radial_ranges.shape[0]
-    size_input = polar_peaks.shape
+def estimate_peak_windows(
+    peaks: Vector,
+    num_bins=200,
+    q_range=None,
+    n_peaks=5,
+    height_percentile=10,
+    prominence_factor=0.1,
+    width_factor=2.0,
+    min_width=0.05,
+    smoothing_sigma=2.0,
+    mode="intensity",
+    log_scale=False,
+    verbose=True,
+):
+    """Find the strongest radial peak families and a q window around each.
 
-    size_output = np.round(np.array(size_input).astype("float") * upsample_factor).astype("int")
+    Parameters
+    ----------
+    peaks : Vector
+        Polar peaks with fields ``(q, theta, intensity)``.
+    num_bins : int
+        Radial bins of the profile.
+    q_range : (float, float), optional
+        Profile range in 1/Angstrom; defaults to (0, max q).
+    n_peaks : int
+        Number of families kept, the most prominent first.
+    height_percentile : float
+        Profile percentile a family must exceed.
+    prominence_factor : float
+        Minimum prominence as a fraction of the profile maximum.
+    width_factor : float
+        Window width in units of the family's FWHM.
+    min_width : float
+        Minimum window width and family spacing, in 1/Angstrom.
+    smoothing_sigma : float
+        Gaussian smoothing of the profile, in bins.
+    mode : {'intensity', 'count'}
+        Profile of summed peak intensity or of peak count.
+    log_scale : bool
+        Detect on log(1 + profile), so weak families are not swamped.
+    verbose : bool
+        Print the families found.
 
-    # Output init
-    orient_hist = np.zeros([num_radii, size_output[0], size_output[1], num_theta_bins])
-
-    # Loop over all probe positions
-    for a0 in range(num_radii):
-        t = "Generating histogram " + str(a0)
-        for rx, ry in tqdmnd(
-            *map(range, size_input), desc=t, unit=" probe positions", disable=not progress_bar
-        ):
-            x = (rx + 0.5) * upsample_factor - 0.5
-            y = (ry + 0.5) * upsample_factor - 0.5
-            x = np.clip(x, 0, size_output[0] - 2)
-            y = np.clip(y, 0, size_output[1] - 2)
-            xF = np.floor(x).astype("int")
-            yF = np.floor(y).astype("int")
-            dx = x - xF
-            dy = y - yF
-
-            add_data = False
-
-            p_r = vector_field_cell(polar_peaks, r_field, rx, ry)
-            p_theta = vector_field_cell(polar_peaks, theta_field, rx, ry)
-
-            if p_r is not None and len(p_r) > 0:
-                r2 = p_r**2
-                sub = np.logical_and(r2 >= radial_ranges_2[a0, 0], r2 < radial_ranges_2[a0, 1])
-                if np.any(sub):
-                    intensity_data = vector_field_cell(peak_intensities, intensity_field, rx, ry)
-                    if intensity_data is not None and len(intensity_data) > 0:
-                        add_data = True
-                        intensity = intensity_data[sub]
-
-                        # Get theta values
-                        theta_radians = p_theta[sub]
-                        if orientation_flip_sign:
-                            theta_radians *= -1
-                        # Add offset
-                        theta_radians += orientation_offset_degrees * np.pi / 180
-                        theta_radians = np.mod(theta_radians, np.pi)
-                        t = theta_radians / dtheta
-
-                        # Spread signal using peak sigma if requested
-                        if use_peak_sigma:
-                            # Try to get sigma values if available
-                            if "sigma_theta" in polar_peaks.fields:
-                                theta_std = (
-                                    vector_field_cell(polar_peaks, "sigma_theta", rx, ry)[sub]
-                                    / dtheta
-                                )
-                                t = (t[:, None] + theta_std[:, None] * v_sigma[None, :]).ravel()
-                                intensity = (intensity[:, None] * w_sigma[None, :]).ravel()
-
-            if add_data:
-                tF = np.floor(t).astype("int")
-                dt = t - tF
-
-                orient_hist[a0, xF, yF, :] = orient_hist[a0, xF, yF, :] + np.bincount(
-                    np.mod(tF, num_theta_bins),
-                    weights=(1 - dx) * (1 - dy) * (1 - dt) * intensity,
-                    minlength=num_theta_bins,
-                )
-                orient_hist[a0, xF, yF, :] = orient_hist[a0, xF, yF, :] + np.bincount(
-                    np.mod(tF + 1, num_theta_bins),
-                    weights=(1 - dx) * (1 - dy) * (dt) * intensity,
-                    minlength=num_theta_bins,
-                )
-
-                orient_hist[a0, xF + 1, yF, :] = orient_hist[a0, xF + 1, yF, :] + np.bincount(
-                    np.mod(tF, num_theta_bins),
-                    weights=(dx) * (1 - dy) * (1 - dt) * intensity,
-                    minlength=num_theta_bins,
-                )
-                orient_hist[a0, xF + 1, yF, :] = orient_hist[a0, xF + 1, yF, :] + np.bincount(
-                    np.mod(tF + 1, num_theta_bins),
-                    weights=(dx) * (1 - dy) * (dt) * intensity,
-                    minlength=num_theta_bins,
-                )
-
-                orient_hist[a0, xF, yF + 1, :] = orient_hist[a0, xF, yF + 1, :] + np.bincount(
-                    np.mod(tF, num_theta_bins),
-                    weights=(1 - dx) * (dy) * (1 - dt) * intensity,
-                    minlength=num_theta_bins,
-                )
-                orient_hist[a0, xF, yF + 1, :] = orient_hist[a0, xF, yF + 1, :] + np.bincount(
-                    np.mod(tF + 1, num_theta_bins),
-                    weights=(1 - dx) * (dy) * (dt) * intensity,
-                    minlength=num_theta_bins,
-                )
-
-                orient_hist[a0, xF + 1, yF + 1, :] = orient_hist[
-                    a0, xF + 1, yF + 1, :
-                ] + np.bincount(
-                    np.mod(tF, num_theta_bins),
-                    weights=(dx) * (dy) * (1 - dt) * intensity,
-                    minlength=num_theta_bins,
-                )
-                orient_hist[a0, xF + 1, yF + 1, :] = orient_hist[
-                    a0, xF + 1, yF + 1, :
-                ] + np.bincount(
-                    np.mod(tF + 1, num_theta_bins),
-                    weights=(dx) * (dy) * (dt) * intensity,
-                    minlength=num_theta_bins,
-                )
-
-    # Smoothing / interpolation
-    if (sigma_x is not None) or (sigma_y is not None) or (sigma_theta is not None):
-        if num_radii > 1:
-            print("Interpolating orientation matrices ...", end="")
-        else:
-            print("Interpolating orientation matrix ...", end="")
-        if sigma_x is not None and sigma_x > 0:
-            orient_hist = gaussian_filter1d(
-                orient_hist,
-                sigma_x * upsample_factor,
-                mode="nearest",
-                axis=1,
-                truncate=3.0,
+    Returns
+    -------
+    centers : np.ndarray
+        ``(n,)`` family q, ascending.
+    windows : np.ndarray
+        ``(n, 2)`` q windows.
+    info : dict
+        ``heights``, ``prominences``, ``widths_fwhm`` (aligned with ``centers``),
+        and the smoothed ``profile`` on ``q``.
+    """
+    q, profile = radial_profile(peaks, num_bins, q_range, mode)
+    if log_scale:
+        profile = np.log1p(profile)
+    if smoothing_sigma > 0:
+        profile = _gaussian_1d(profile, smoothing_sigma, axis=0)
+    dq = q[1] - q[0]
+    found, props = find_peaks(
+        profile,
+        height=np.percentile(profile, height_percentile),
+        prominence=prominence_factor * profile.max(),
+        distance=max(1, int(min_width / dq)),
+    )
+    top = np.sort(np.argsort(props["prominences"])[::-1][:n_peaks])
+    index = found[top]
+    fwhm = peak_widths(profile, index, rel_height=0.5)[0] * dq
+    half = np.maximum(width_factor * fwhm / 2, min_width / 2)
+    centers = q[index]
+    windows = np.clip(
+        np.column_stack([centers - half, centers + half]), q[0] - dq / 2, q[-1] + dq / 2
+    )
+    info = {
+        "heights": profile[index],
+        "prominences": props["prominences"][top],
+        "widths_fwhm": fwhm,
+        "q": q,
+        "profile": profile,
+    }
+    if verbose:
+        for i, (c, w, f) in enumerate(zip(centers, windows, fwhm)):
+            print(
+                f"Family {i}: q = {c:.3f} 1/A (d = {1 / c:.2f} A), "
+                f"window [{w[0]:.3f}, {w[1]:.3f}] 1/A, FWHM {f:.3f} 1/A"
             )
-        if sigma_y is not None and sigma_y > 0:
-            orient_hist = gaussian_filter1d(
-                orient_hist,
-                sigma_y * upsample_factor,
-                mode="nearest",
-                axis=2,
-                truncate=3.0,
-            )
-        if sigma_theta is not None and sigma_theta > 0:
-            orient_hist = gaussian_filter1d(
-                orient_hist, sigma_theta / dtheta_deg, mode="wrap", axis=3, truncate=2.0
-            )
-        print(" done.")
+    return centers, windows, info
 
-    # Normalization
-    if normalize_intensity_stack is True:
-        stack_max = np.max(orient_hist)
-        if stack_max > 0:
-            orient_hist = orient_hist / stack_max
-    elif normalize_intensity_image is True:
-        for a0 in range(num_radii):
-            image_max = np.max(orient_hist[a0, :, :, :])
-            if image_max > 0:
-                orient_hist[a0, :, :, :] /= image_max
 
-    return orient_hist
+def plot_radial_profile(
+    peaks: Vector,
+    windows=None,
+    centers=None,
+    lines: dict | None = None,
+    num_bins=200,
+    q_range=None,
+    mode="intensity",
+    log_scale=False,
+    show_d_spacing=False,
+    figax=None,
+):
+    """Plot the radial profile with peak windows, centers and reference lines.
+
+    Parameters
+    ----------
+    peaks : Vector
+        Polar peaks with fields ``(q, theta, intensity)``.
+    windows : np.ndarray, optional
+        ``(n, 2)`` q windows, shaded with the profile filled inside them.
+    centers : np.ndarray, optional
+        Family centers, drawn as lines.
+    lines : dict, optional
+        ``{label: q values}`` reference lines, e.g. known reflections.
+    mode, num_bins, q_range
+        As in :func:`radial_profile`.
+    log_scale : bool
+        Logarithmic intensity axis.
+    show_d_spacing : bool
+        Add a d-spacing axis on top.
+    figax : (Figure, Axes), optional
+        Draw into existing axes.
+    """
+    q, profile = radial_profile(peaks, num_bins, q_range, mode)
+    fig, ax = plt.subplots(figsize=(7, 4)) if figax is None else figax
+    ax.plot(q, profile, color="black", lw=1.5)
+    base = profile[profile > 0].min() if log_scale and np.any(profile > 0) else 0
+    for i, (lo, hi) in enumerate(np.atleast_2d(windows) if windows is not None else []):
+        inside = (q >= lo) & (q <= hi)
+        ax.axvspan(lo, hi, color="tab:red", alpha=0.2, lw=0, label="windows" if i == 0 else None)
+        ax.fill_between(q[inside], base, profile[inside], color="tab:red", alpha=0.5)
+    for i, c in enumerate(np.atleast_1d(centers) if centers is not None else []):
+        ax.axvline(c, color="tab:red", lw=1.5, label="centers" if i == 0 else None)
+    colors = plt.cm.tab10(np.arange(len(lines or {})) % 10)
+    for color, (label, values) in zip(colors, (lines or {}).items()):
+        for j, v in enumerate(np.atleast_1d(values)):
+            ax.axvline(v, color=color, ls="--", lw=1, label=label if j == 0 else None)
+    if log_scale:
+        ax.set_yscale("log")
+    if show_d_spacing:
+        inv = (lambda x: 1 / np.clip(x, 1e-12, None), lambda x: 1 / np.clip(x, 1e-12, None))
+        ax.secondary_xaxis("top", functions=inv).set_xlabel("d-spacing (A)")
+    ax.set(xlabel="q (1/A)", ylabel="peak intensity" if mode == "intensity" else "peak count")
+    if windows is not None or centers is not None or lines:
+        ax.legend(fontsize=8)
+    return fig, ax
+
+
+def peak_maps(peaks: Vector, q_ranges=None, mode="count", min_intensity=None, plot=True, **kwargs):
+    """Per-position peak count or summed intensity, one map per q range.
+
+    Parameters
+    ----------
+    peaks : Vector
+        Polar peaks with fields ``(q, theta, intensity)``.
+    q_ranges : np.ndarray, optional
+        ``(n, 2)`` q windows; None counts every peak.
+    mode : {'count', 'intensity'}
+        What each map accumulates.
+    min_intensity : float, optional
+        Ignore weaker peaks.
+    plot : bool
+        Show the maps with :func:`~quantem.core.visualization.show_2d`.
+    **kwargs
+        Passed to ``show_2d``.
+
+    Returns
+    -------
+    np.ndarray
+        ``(n, scan_row, scan_col)`` maps.
+    """
+    data, rows, cols = _flat(peaks)
+    ranges = np.array([[-np.inf, np.inf]]) if q_ranges is None else np.atleast_2d(q_ranges)
+    keep = np.ones(len(data), bool) if min_intensity is None else data[:, 2] >= min_intensity
+    weight = np.ones(len(data)) if mode == "count" else data[:, 2]
+    maps = np.zeros((len(ranges), *peaks.shape[:2]))
+    for k, (lo, hi) in enumerate(ranges):
+        sel = keep & (data[:, 0] >= lo) & (data[:, 0] < hi)
+        np.add.at(maps[k], (rows[sel], cols[sel]), weight[sel])
+    if plot:
+        titles = (
+            [f"q {lo:.2f}-{hi:.2f} 1/A" for lo, hi in ranges] if q_ranges is not None else None
+        )
+        show_2d(list(maps), title=titles, cbar=True, **kwargs)
+    return maps
+
+
+def make_orientation_histogram(
+    peaks: Vector,
+    radial_ranges,
+    upsample_factor=4.0,
+    theta_step_deg=1.0,
+    sigma_x=1.0,
+    sigma_y=1.0,
+    sigma_theta=3.0,
+    normalize="stack",
+):
+    """Intensity histogram of peak orientation at each scan position.
+
+    Each peak in a radial window is spread trilinearly over the upsampled scan
+    grid and the theta bins (pi-periodic), and the histogram is then smoothed.
+
+    Parameters
+    ----------
+    peaks : Vector
+        Polar peaks with fields ``(q, theta, intensity)``.
+    radial_ranges : np.ndarray
+        ``(n, 2)`` q windows, or one ``(2,)`` window.
+    upsample_factor : float
+        Scan upsampling of the output.
+    theta_step_deg : float
+        Theta bin size in degrees.
+    sigma_x, sigma_y : float
+        Gaussian smoothing along scan rows and columns, in scan pixels.
+    sigma_theta : float
+        Gaussian smoothing along theta, in degrees (periodic).
+    normalize : {'stack', 'image', None}
+        Scale the maximum of the whole histogram, or of each window, to 1.
+
+    Returns
+    -------
+    np.ndarray
+        ``(n, scan_row * up, scan_col * up, num_theta)`` histogram.
+    """
+    ranges = np.atleast_2d(radial_ranges)
+    num_theta = len(np.arange(0, 180, theta_step_deg))
+    dtheta = np.deg2rad(theta_step_deg)
+    size = np.round(np.array(peaks.shape[:2], float) * upsample_factor).astype(int)
+    hist = np.zeros((len(ranges), size[0], size[1], num_theta))
+    data, rows, cols = _flat(peaks)
+    x = np.clip((rows + 0.5) * upsample_factor - 0.5, 0, size[0] - 2)
+    y = np.clip((cols + 0.5) * upsample_factor - 0.5, 0, size[1] - 2)
+    t = np.mod(data[:, 1], np.pi) / dtheta
+    for k, (lo, hi) in enumerate(ranges):
+        sel = (data[:, 0] ** 2 >= lo**2) & (data[:, 0] ** 2 < hi**2)
+        _splat(hist[k], x[sel], y[sel], t[sel], data[sel, 2])
+    if sigma_x:
+        hist = _gaussian_1d(hist, sigma_x * upsample_factor, axis=1, mode="nearest", truncate=3.0)
+    if sigma_y:
+        hist = _gaussian_1d(hist, sigma_y * upsample_factor, axis=2, mode="nearest", truncate=3.0)
+    if sigma_theta:
+        hist = _gaussian_1d(hist, sigma_theta / theta_step_deg, axis=3, mode="wrap", truncate=2.0)
+    if normalize == "stack" and hist.max() > 0:
+        hist /= hist.max()
+    elif normalize == "image":
+        hist /= np.maximum(hist.max(axis=(1, 2, 3), keepdims=True), np.finfo(float).tiny)
+    return hist
 
 
 def make_flowline_map(
@@ -355,312 +330,130 @@ def make_flowline_map(
     sigma_x=1.0,
     sigma_y=1.0,
     sigma_theta=2.0,
-    progress_bar: bool = True,
+    seed=None,
+    progress_bar=True,
 ):
+    """Trace flowlines through an orientation histogram.
+
+    Seeds are local maxima in theta above ``thresh_seed``. From each seed a line
+    is grown both ways, perpendicular to the local orientation (a weighted mean
+    over a Gaussian neighbourhood), until the histogram falls below
+    ``thresh_grow`` or the line comes within ``sep_xy`` / ``sep_theta`` of one
+    already drawn.
+
+    Parameters
+    ----------
+    orient_hist : np.ndarray
+        ``(n, rows, cols, num_theta)`` histogram from :func:`make_orientation_histogram`.
+    thresh_seed, thresh_grow, thresh_collision : float
+        Seed, growth and collision thresholds.
+    sep_seeds : int, optional
+        Seed spacing in pixels; defaults to half of ``sep_xy``.
+    sep_xy, sep_theta : float or array
+        Collision radius in pixels and theta bins, per window if an array.
+    sort_seeds : {'intensity', 'random', None}
+        Growth order of the seeds.
+    linewidth : float
+        Line width in pixels.
+    step_size : float
+        Growth step in pixels.
+    min_steps, max_steps : int
+        Shortest line drawn and longest line grown.
+    sigma_x, sigma_y, sigma_theta : float
+        Neighbourhood used to update the direction, in pixels and theta bins.
+    seed : int, optional
+        Random seed for ``sort_seeds='random'``.
+    progress_bar : bool
+        Show progress over seeds.
+
+    Returns
+    -------
+    np.ndarray
+        Flowline intensity, same shape as ``orient_hist``.
     """
-    Create an 3D or 4D orientation flowline map - essentially a pixelated "stream map" which represents diffraction data.
+    num_radii, n_r, n_c, n_t = orient_hist.shape
+    sep_xy = np.broadcast_to(np.atleast_1d(sep_xy), (num_radii,))
+    sep_theta = np.broadcast_to(np.atleast_1d(sep_theta), (num_radii,))
+    sep_seeds = int(np.round(sep_xy.min() / 2 + 0.5)) if sep_seeds is None else int(sep_seeds)
+    dtheta = np.pi / n_t
+    theta = np.arange(n_t) * dtheta
 
-    Args:
-        orient_hist (array):        Histogram of all orientations with coordinates
-                                    [radial_bin x_probe y_probe theta]
-                                    We assume theta bin ranges from 0 to 180 degrees and is periodic.
-        thresh_seed (float):        Threshold for seed generation in histogram.
-        thresh_grow (float):        Threshold for flowline growth in histogram.
-        thresh_collision (float):   Threshold for termination of flowline growth in histogram.
-        sep_seeds (float):          Initial seed separation in bins - set to None to use default value,
-                                    which is equal to 0.5*sep_xy.
-        sep_xy (float):             Search radius for flowline direction in x and y.
-        sep_theta = (float):        Search radius for flowline direction in theta.
-        sort_seeds (str):           How to sort the initial seeds for growth:
-                                        None - no sorting
-                                        'intensity' - sort by histogram intensity
-                                        'random' - random order
-        linewidth (float):          Thickness of the flowlines in pixels.
-        step_size (float):          Step size for flowline growth in pixels.
-        min_steps (int):            Minimum number of steps for a flowline to be drawn.
-        max_steps (int):            Maximum number of steps for a flowline to be drawn.
-        sigma_x (float):            Weighted sigma in x direction for direction update.
-        sigma_y (float):            Weighted sigma in y direction for direction update.
-        sigma_theta (float):        Weighted sigma in theta for direction update.
-        progress_bar (bool):        Enable progress bar
-
-    Returns:
-        orient_flowlines (array):   4D array containing flowlines
-                                    [radial_bin x_probe y_probe theta]
-    """
-
-    # Ensure sep_xy and sep_theta are arrays
-    sep_xy = np.atleast_1d(sep_xy)
-    sep_theta = np.atleast_1d(sep_theta)
-
-    # number of radial bins
-    num_radii = orient_hist.shape[0]
-    if num_radii > 1 and len(sep_xy) == 1:
-        sep_xy = np.ones(num_radii) * sep_xy
-    if num_radii > 1 and len(sep_theta) == 1:
-        sep_theta = np.ones(num_radii) * sep_theta
-
-    # Default seed separation
-    if sep_seeds is None:
-        sep_seeds = np.round(np.min(sep_xy) / 2 + 0.5).astype("int")
-    else:
-        sep_seeds = np.atleast_1d(sep_seeds).astype("int")
-        if num_radii > 1 and len(sep_seeds) == 1:
-            sep_seeds = (np.ones(num_radii) * sep_seeds).astype("int")
-
-    # coordinates
-    theta = np.linspace(0, np.pi, orient_hist.shape[3], endpoint=False)
-    dtheta = theta[1] - theta[0]
-
-    # initialize weighting array
-    vx = np.arange(-np.ceil(2 * sigma_x), np.ceil(2 * sigma_x) + 1)
-    vy = np.arange(-np.ceil(2 * sigma_y), np.ceil(2 * sigma_y) + 1)
-    vt = np.arange(-np.ceil(2 * sigma_theta), np.ceil(2 * sigma_theta) + 1)
-    ay, ax, at = np.meshgrid(vy, vx, vt)
-    k = (
-        np.exp(ax**2 / (-2 * sigma_x**2))
-        * np.exp(ay**2 / (-2 * sigma_y**2))
-        * np.exp(at**2 / (-2 * sigma_theta**2))
+    vx = np.arange(-np.ceil(2 * sigma_x), np.ceil(2 * sigma_x) + 1).astype(int)
+    vy = np.arange(-np.ceil(2 * sigma_y), np.ceil(2 * sigma_y) + 1).astype(int)
+    vt = np.arange(-np.ceil(2 * sigma_theta), np.ceil(2 * sigma_theta) + 1).astype(int)
+    ax_, ay_, at_ = np.meshgrid(vx, vy, vt, indexing="ij")
+    kernel = np.exp(-(ax_**2) / (2 * sigma_x**2) - ay_**2 / (2 * sigma_y**2))
+    kernel *= np.exp(-(at_**2) / (2 * sigma_theta**2))
+    neighbourhood = (
+        vx[:, None, None],
+        vy[None, :, None],
+        vt[None, None, :],
+        kernel / kernel.sum(),
     )
-    k = k / np.sum(k)
-    vx = vx[:, None, None].astype("int")
-    vy = vy[None, :, None].astype("int")
-    vt = vt[None, None, :].astype("int")
+    rng = np.random.default_rng(seed)
 
-    # initalize flowline array
-    orient_flowlines = np.zeros_like(orient_hist)
+    flow = np.zeros_like(orient_hist)
+    for k in range(num_radii):
+        orient = orient_hist[k]
+        cr = np.arange(-np.ceil(sep_xy[k]), np.ceil(sep_xy[k]) + 1).astype(int)
+        ct = np.arange(-np.ceil(sep_theta[k]), np.ceil(sep_theta[k]) + 1).astype(int)
+        gx, gy, gt = np.meshgrid(cr, cr, ct, indexing="ij")
+        ring = (gx**2 + gy**2) / sep_xy[k] ** 2 + gt**2 / sep_theta[k] ** 2
+        collision = (cr[:, None, None], cr[None, :, None], ct[None, None, :])
+        collision += (ring <= (1 + 1 / sep_xy[k]) ** 2,)
 
-    # initialize output
-    xy_t_int = np.zeros((max_steps + 1, 4))
-    xy_t_int_rev = np.zeros((max_steps + 1, 4))
+        seeds = (orient >= np.roll(orient, 1, axis=2)) & (orient >= np.roll(orient, -1, axis=2))
+        seeds &= orient >= thresh_seed
+        if sep_seeds > 1:
+            seeds[np.arange(n_r) % sep_seeds != sep_seeds - 1] = False
+            seeds[:, np.arange(n_c) % sep_seeds != sep_seeds - 1] = False
+        xs, ys, ts = np.nonzero(seeds)
+        if sort_seeds == "intensity":
+            order = np.argsort(orient[seeds])[::-1]
+        elif sort_seeds == "random":
+            order = rng.permutation(len(xs))
+        else:
+            order = np.arange(len(xs))
 
-    # Loop over radial bins
-    for a0 in range(num_radii):
-        # initialize collision check array
-        cr = np.arange(-np.ceil(sep_xy[a0]), np.ceil(sep_xy[a0]) + 1)
-        ct = np.arange(-np.ceil(sep_theta[a0]), np.ceil(sep_theta[a0]) + 1)
-        ay, ax, at = np.meshgrid(cr, cr, ct)
-        c_mask = (
-            (ax**2 + ay**2) / sep_xy[a0] ** 2 + at**2 / sep_theta[a0] ** 2
-            <= (1 + 1 / sep_xy[a0]) ** 2
-        )[None, :, :, :]
-        cx = cr[None, :, None, None].astype("int")
-        cy = cr[None, None, :, None].astype("int")
-        ct = ct[None, None, None, :].astype("int")
+        for i in tqdm(order, desc=f"Drawing flowlines {k}", disable=not progress_bar):
+            xy0 = np.array([xs[i], ys[i]], float)
+            t0 = _local_angle(orient, xy0, theta[ts[i]], dtheta, neighbourhood)
+            args = (orient, flow[k], xy0, t0, dtheta, neighbourhood, collision, step_size)
+            path = [
+                p
+                for sign in (1, -1)
+                for p in _trace(*args, sign, thresh_grow, thresh_collision, max_steps)
+            ]
+            if len(path) + 2 > min_steps and path:
+                _splat(flow[k], *np.array(path).T)
 
-        # Find all seed locations
-        orient = orient_hist[a0, :, :, :]
-        sub_seeds = np.logical_and(
-            np.logical_and(
-                orient >= np.roll(orient, 1, axis=2),
-                orient >= np.roll(orient, -1, axis=2),
-            ),
-            orient >= thresh_seed,
-        )
-
-        # Separate seeds
-        if sep_seeds > 0:
-            for a1 in range(sep_seeds - 1):
-                sub_seeds[a1::sep_seeds, :, :] = False
-                sub_seeds[:, a1::sep_seeds, :] = False
-
-        # Index seeds
-        x_inds, y_inds, t_inds = np.where(sub_seeds)
-        if sort_seeds is not None:
-            if sort_seeds == "intensity":
-                inds_sort = np.argsort(orient[sub_seeds])[::-1]
-            elif sort_seeds == "random":
-                inds_sort = np.random.permutation(np.count_nonzero(sub_seeds))
-            x_inds = x_inds[inds_sort]
-            y_inds = y_inds[inds_sort]
-            t_inds = t_inds[inds_sort]
-
-        # for a1 in tqdmnd(range(0,40), desc="Drawing flowlines",unit=" seeds", disable=not progress_bar):
-        t = "Drawing flowlines " + str(a0)
-        for a1 in tqdm(range(0, x_inds.shape[0]), desc=t, unit=" seeds", disable=not progress_bar):
-            # initial coordinate and intensity
-            xy0 = np.array((x_inds[a1], y_inds[a1]))
-            t0 = theta[t_inds[a1]]
-
-            # init theta
-            inds_theta = np.mod(np.round(t0 / dtheta).astype("int") + vt, orient.shape[2])
-            orient_crop = (
-                k
-                * orient[
-                    np.clip(np.round(xy0[0]).astype("int") + vx, 0, orient.shape[0] - 1),
-                    np.clip(np.round(xy0[1]).astype("int") + vy, 0, orient.shape[1] - 1),
-                    inds_theta,
-                ]
-            )
-            theta_crop = theta[inds_theta]
-            t0 = np.sum(orient_crop * theta_crop) / np.sum(orient_crop)
-
-            # forward direction
-            t = t0
-            v0 = np.array((np.cos(t), -np.sin(t)))
-            v = v0 * step_size
-            xy = xy0
-            int_val = _get_intensity(orient, xy0[0], xy0[1], t0 / dtheta)
-            xy_t_int[0, 0:2] = xy0
-            xy_t_int[0, 2] = t / dtheta
-            xy_t_int[0, 3] = int_val
-            # main loop
-            grow = True
-            count = 0
-            while grow is True:
-                count += 1
-
-                # update position and intensity
-                xy = xy + v
-                int_val = _get_intensity(orient, xy[0], xy[1], t / dtheta)
-
-                # check for collision
-                flow_crop = orient_flowlines[
-                    a0,
-                    np.clip(np.round(xy[0]).astype("int") + cx, 0, orient.shape[0] - 1),
-                    np.clip(np.round(xy[1]).astype("int") + cy, 0, orient.shape[1] - 1),
-                    np.mod(np.round(t / dtheta).astype("int") + ct, orient.shape[2]),
-                ]
-                int_flow = np.max(flow_crop[c_mask])
-
-                if (
-                    xy[0] < 0
-                    or xy[1] < 0
-                    or xy[0] > orient.shape[0]
-                    or xy[1] > orient.shape[1]
-                    or int_val < thresh_grow
-                    or int_flow > thresh_collision
-                ):
-                    grow = False
-                else:
-                    # update direction
-                    inds_theta = np.mod(np.round(t / dtheta).astype("int") + vt, orient.shape[2])
-                    orient_crop = (
-                        k
-                        * orient[
-                            np.clip(
-                                np.round(xy[0]).astype("int") + vx,
-                                0,
-                                orient.shape[0] - 1,
-                            ),
-                            np.clip(
-                                np.round(xy[1]).astype("int") + vy,
-                                0,
-                                orient.shape[1] - 1,
-                            ),
-                            inds_theta,
-                        ]
-                    )
-                    theta_crop = theta[inds_theta]
-                    t = np.sum(orient_crop * theta_crop) / np.sum(orient_crop)
-                    # v = np.array((np.cos(t), np.sin(t))) * step_size
-                    # v = np.array((np.sin(t), np.cos(t))) * step_size
-                    # v = np.array((-np.sin(t), np.cos(t))) * step_size
-
-                    xy_t_int[count, 0:2] = xy
-                    xy_t_int[count, 2] = t / dtheta
-                    xy_t_int[count, 3] = int_val
-
-                    if count > max_steps - 1:
-                        grow = False
-
-            # reverse direction
-            t = t0 + np.pi
-            v0 = np.array((np.cos(t), -np.sin(t)))
-            v = v0 * step_size
-            xy = xy0
-            int_val = _get_intensity(orient, xy0[0], xy0[1], t0 / dtheta)
-            xy_t_int_rev[0, 0:2] = xy0
-            xy_t_int_rev[0, 2] = t / dtheta
-            xy_t_int_rev[0, 3] = int_val
-            # main loop
-            grow = True
-            count_rev = 0
-            while grow is True:
-                count_rev += 1
-
-                # update position and intensity
-                xy = xy + v
-                int_val = _get_intensity(orient, xy[0], xy[1], t / dtheta)
-
-                # check for collision
-                flow_crop = orient_flowlines[
-                    a0,
-                    np.clip(np.round(xy[0]).astype("int") + cx, 0, orient.shape[0] - 1),
-                    np.clip(np.round(xy[1]).astype("int") + cy, 0, orient.shape[1] - 1),
-                    np.mod(np.round(t / dtheta).astype("int") + ct, orient.shape[2]),
-                ]
-                int_flow = np.max(flow_crop[c_mask])
-
-                if (
-                    xy[0] < 0
-                    or xy[1] < 0
-                    or xy[0] > orient.shape[0]
-                    or xy[1] > orient.shape[1]
-                    or int_val < thresh_grow
-                    or int_flow > thresh_collision
-                ):
-                    grow = False
-                else:
-                    # update direction
-                    inds_theta = np.mod(np.round(t / dtheta).astype("int") + vt, orient.shape[2])
-                    orient_crop = (
-                        k
-                        * orient[
-                            np.clip(
-                                np.round(xy[0]).astype("int") + vx,
-                                0,
-                                orient.shape[0] - 1,
-                            ),
-                            np.clip(
-                                np.round(xy[1]).astype("int") + vy,
-                                0,
-                                orient.shape[1] - 1,
-                            ),
-                            inds_theta,
-                        ]
-                    )
-                    theta_crop = theta[inds_theta]
-                    t = np.sum(orient_crop * theta_crop) / np.sum(orient_crop) + np.pi
-                    v = np.array((np.cos(t), -np.sin(t))) * step_size
-                    v = np.array((np.cos(t), -np.sin(t))) * step_size
-                    # v = np.array((-np.sin(t), np.cos(t))) * step_size
-
-                    xy_t_int_rev[count_rev, 0:2] = xy
-                    xy_t_int_rev[count_rev, 2] = t / dtheta
-                    xy_t_int_rev[count_rev, 3] = int_val
-
-                    if count_rev > max_steps - 1:
-                        grow = False
-
-            # write into output array
-            if count + count_rev > min_steps:
-                if count > 0:
-                    orient_flowlines[a0, :, :, :] = _set_intensity(
-                        orient_flowlines[a0, :, :, :], xy_t_int[1:count, :]
-                    )
-                if count_rev > 1:
-                    orient_flowlines[a0, :, :, :] = _set_intensity(
-                        orient_flowlines[a0, :, :, :], xy_t_int_rev[1:count_rev, :]
-                    )
-
-    # normalize to step size
-    orient_flowlines = orient_flowlines * step_size
-
-    # linewidth
+    flow *= step_size
     if linewidth > 1.0:
         s = linewidth - 1.0
+        flow = _gaussian_1d(flow, s, axis=1, truncate=3.0)
+        flow = _gaussian_1d(flow, s, axis=2, truncate=3.0) * s**2
+    return flow
 
-        orient_flowlines = gaussian_filter1d(orient_flowlines, s, axis=1, truncate=3.0)
-        orient_flowlines = gaussian_filter1d(orient_flowlines, s, axis=2, truncate=3.0)
-        orient_flowlines = orient_flowlines * (s**2)
 
-    return orient_flowlines
+def _flowline_colors(theta, sym_rotation_order=2, theta_offset=np.pi):
+    """RGB of each orientation: red, green and blue lobes 120 degrees apart."""
+    basis = np.array([[1.0, 0.0, 0.0], [0.0, 0.7, 0.0], [0.0, 0.3, 1.0]])
+    phase = theta_offset - np.asarray(theta) * sym_rotation_order
+    lobes = [
+        np.maximum(
+            1
+            - (np.mod(phase - 2 * np.pi * j / 3 + np.pi, 2 * np.pi) - np.pi) ** 2
+            / (2 * np.pi / 3) ** 2,
+            0,
+        )
+        for j in range(3)
+    ]
+    return np.stack(lobes, axis=-1) @ basis
 
 
 def make_flowline_rainbow_image(
     orient_flowlines,
-    int_range=[0, 0.2],
+    int_range=(0.0, 0.2),
     sym_rotation_order=2,
     theta_offset=np.pi,
     greyscale=False,
@@ -669,330 +462,236 @@ def make_flowline_rainbow_image(
     power_scaling=1.0,
     sum_radial_bins=False,
     plot_images=True,
-    figsize=None,
 ):
-    """
-    Generate RGB output images from the flowline arrays.
-
-    Args:
-        orient_flowline (array):    Histogram of all orientations with coordinates [x y radial_bin theta]
-                                    We assume theta bin ranges from 0 to 180 degrees and is periodic.
-        int_range (float)           2 element array giving the intensity range
-        sym_rotation_order (int):   rotational symmety for colouring
-        theta_offset (float):       Offset the anglular coloring by this value in radians.
-                                    Default pi rotates the hue mapping by 90deg (nematic
-                                    sym=2) so color tracks the drawn flowline direction:
-                                    cyan for vertical lines, red for horizontal.
-        greyscale (bool):           Set to False for color output, True for greyscale output.
-        greyscale_max (bool):       If output is greyscale, use max instead of mean for overlapping flowlines.
-        white_background (bool):    For either color or greyscale output, switch to white background (from black).
-        power_scaling (float):      Power law scaling for flowline intensity output.
-        sum_radial_bins (bool):     Sum all radial bins (alternative is to output separate images).
-        plot_images (bool):         Plot the outputs for quick visualization.
-        figsize (2-tuple):          Size of output figure.
-
-    Returns:
-        im_flowline (array):        3D or 4D array containing flowline images
-    """
-
-    # init array
-    size_input = orient_flowlines.shape
-    size_output = np.array([size_input[0], size_input[1], size_input[2], 3])
-    im_flowline = np.zeros(size_output)
-    theta_offset = np.atleast_1d(theta_offset)
-
-    if greyscale is True:
-        for a0 in range(size_input[0]):
-            if greyscale_max is True:
-                im = np.max(orient_flowlines[a0, :, :, :], axis=2)
-            else:
-                im = np.mean(orient_flowlines[a0, :, :, :], axis=2)
-
-            sig = np.clip((im - int_range[0]) / (int_range[1] - int_range[0]), 0, 1)
-
-            if power_scaling != 1:
-                sig = sig**power_scaling
-
-            if white_background is False:
-                im_flowline[a0, :, :, :] = sig[:, :, None]
-            else:
-                im_flowline[a0, :, :, :] = 1 - sig[:, :, None]
-
-    else:
-        # Color basis
-        c0 = np.array([1.0, 0.0, 0.0])
-        c1 = np.array([0.0, 0.7, 0.0])
-        c2 = np.array([0.0, 0.3, 1.0])
-
-        # angles
-        theta = np.linspace(0, np.pi, size_input[3], endpoint=False)
-        # Negate so the hue handedness matches the drawn flowline direction in the
-        # displayed (y-down) map: red horizontal, cyan vertical, "/" yellow, "\" purple.
-        theta_color = -theta * sym_rotation_order
-
-        if size_input[0] > 1 and len(theta_offset) == 1:
-            theta_offset = np.ones(size_input[0]) * theta_offset
-
-        for a0 in range(size_input[0]):
-            # color projections
-            b0 = np.maximum(
-                1
-                - np.abs(np.mod(theta_offset[a0] + theta_color + np.pi, 2 * np.pi) - np.pi) ** 2
-                / (np.pi * 2 / 3) ** 2,
-                0,
-            )
-            b1 = np.maximum(
-                1
-                - np.abs(
-                    np.mod(
-                        theta_offset[a0] + theta_color - np.pi * 2 / 3 + np.pi,
-                        2 * np.pi,
-                    )
-                    - np.pi
-                )
-                ** 2
-                / (np.pi * 2 / 3) ** 2,
-                0,
-            )
-            b2 = np.maximum(
-                1
-                - np.abs(
-                    np.mod(
-                        theta_offset[a0] + theta_color - np.pi * 4 / 3 + np.pi,
-                        2 * np.pi,
-                    )
-                    - np.pi
-                )
-                ** 2
-                / (np.pi * 2 / 3) ** 2,
-                0,
-            )
-
-            sig = np.clip(
-                (orient_flowlines[a0, :, :, :] - int_range[0]) / (int_range[1] - int_range[0]),
-                0,
-                1,
-            )
-            if power_scaling != 1:
-                sig = sig**power_scaling
-
-            im_flowline[a0, :, :, :] = (
-                np.sum(sig * b0[None, None, :], axis=2)[:, :, None] * c0[None, None, :]
-                + np.sum(sig * b1[None, None, :], axis=2)[:, :, None] * c1[None, None, :]
-                + np.sum(sig * b2[None, None, :], axis=2)[:, :, None] * c2[None, None, :]
-            )
-
-            # clip limits
-            im_flowline[a0, :, :, :] = np.clip(im_flowline[a0, :, :, :], 0, 1)
-
-            # contrast flip
-            if white_background is True:
-                im = rgb_to_hsv(im_flowline[a0])
-                im_v = im[:, :, 2]
-                im[:, :, 1] = im_v
-                im[:, :, 2] = 1
-                im_flowline[a0] = hsv_to_rgb(im)
-
-    if sum_radial_bins is True:
-        if white_background is False:
-            im_flowline = np.clip(np.sum(im_flowline, axis=0), 0, 1)[None, :, :, :]
-        else:
-            # im_flowline = np.clip(np.sum(im_flowline,axis=0)+1-im_flowline.shape[0],0,1)[None,:,:,:]
-            im_flowline = np.min(im_flowline, axis=0)[None, :, :, :]
-
-    if plot_images is True:
-        if figsize is None:
-            fig, ax = plt.subplots(
-                im_flowline.shape[0], 1, figsize=(10, im_flowline.shape[0] * 10)
-            )
-        else:
-            fig, ax = plt.subplots(im_flowline.shape[0], 1, figsize=figsize)
-
-        if im_flowline.shape[0] > 1:
-            for a0 in range(im_flowline.shape[0]):
-                ax[a0].imshow(im_flowline[a0])
-                # ax[a0].axis('off')
-            plt.subplots_adjust(wspace=0, hspace=0.02)
-        else:
-            ax.imshow(im_flowline[0])
-            # ax.axis('off')
-        plt.show()
-
-    return im_flowline
-
-
-def make_flowline_rainbow_legend(
-    im_size=np.array([256, 256]),
-    sym_rotation_order=2,
-    theta_offset_degrees=0.0,
-    white_background=False,
-    return_image=False,
-    radial_range=np.array([0.45, 0.9]),
-    plot_legend=True,
-    figsize=(4, 4),
-):
-    """
-    This function generates a legend for a the rainbow colored flowline maps, and returns it as an RGB image.
+    """RGB image of the flowlines, coloured by orientation.
 
     Parameters
     ----------
-    im_size (np.array):
-        Size of legend image in pixels.
-    sym_rotation_order (int):
-        rotational symmety for colouring
-    theta_offset_degrees (float):
-        Offset the anglular coloring by this value in degrees.
-        Rotation is Q with respect to R, in the positive (counter clockwise) direction.
-    white_background (bool):
-        For either color or greyscale output, switch to white background (from black).
-    return_image (bool):
-        Return the image array.
-    radial_range (np.array):
-        Inner and outer radius for the legend ring.
-    plot_legend (bool):
-        Plot the generated legend.
-    figsize (tuple or list):
-        Size of the plotted legend.
+    orient_flowlines : np.ndarray
+        Output of :func:`make_flowline_map`.
+    int_range : (float, float)
+        Flowline intensity mapped to black and full colour.
+    sym_rotation_order : int
+        Rotational symmetry of the colouring.
+    theta_offset : float or array
+        Rotation of the colour wheel in radians, per window if an array. The
+        default pi colours horizontal lines red and vertical lines cyan.
+    greyscale : bool
+        Grey levels instead of colour, from the max (``greyscale_max``) or mean
+        over theta.
+    white_background : bool
+        Invert the background to white.
+    power_scaling : float
+        Power applied to the scaled intensity.
+    sum_radial_bins : bool
+        Combine all windows into one image.
+    plot_images : bool
+        Show the images.
 
     Returns
-    ----------
-
-    im_legend (array):
-        Image array for the legend.
+    -------
+    np.ndarray
+        ``(n, rows, cols, 3)`` RGB images.
     """
 
-    # Coordinates
-    x = np.linspace(-1, 1, im_size[0])
-    y = np.linspace(-1, 1, im_size[1])
-    ya, xa = np.meshgrid(y, x)
-    # TODO: Can replace with squared term? ra2? Faster
-    # ra = np.sqrt(xa**2 + ya**2)
-    ra2 = xa**2 + ya**2
-    ta = np.arctan2(ya, xa) + np.deg2rad(theta_offset_degrees)
-    ta_sym = ta * sym_rotation_order
+    def scaled(a):
+        return np.clip((a - int_range[0]) / (int_range[1] - int_range[0]), 0, 1) ** power_scaling
 
-    # mask
-    mask = np.logical_and(ra2 > radial_range[0] ** 2, ra2 < radial_range[1] ** 2)
-    # mask = np.logical_and(ra > radial_range[0], ra < radial_range[1])
-
-    # rgb image
-    z = mask * np.exp(1j * ta_sym)
-    # hue_offset = 0
-    amp = np.abs(z)
-    vmin = np.min(amp)
-    vmax = np.max(amp)
-    ph = np.angle(z)  # + hue_offset
-    h = np.mod(ph / (2 * np.pi), 1)
-    s = 0.85 * np.ones_like(h)
-    v = (amp - vmin) / (vmax - vmin)
-    im_legend = hsv_to_rgb(np.dstack((h, s, v)))
-
-    if white_background is True:
-        im_legend[im_legend.sum(2) == 0] = 1
-
-    # plotting
-    if plot_legend:
-        fig, ax = plt.subplots(1, 1, figsize=figsize)
-        ax.imshow(im_legend)
-        ax.invert_yaxis()
-        # ax.set_axis_off()
-        ax.axis("off")
-
-    if return_image:
-        return im_legend
+    if greyscale:
+        im = scaled(orient_flowlines.max(-1) if greyscale_max else orient_flowlines.mean(-1))
+        image = np.repeat((1 - im if white_background else im)[..., None], 3, axis=-1)
+    else:
+        sig = scaled(orient_flowlines)
+        theta = np.arange(sig.shape[-1]) * np.pi / sig.shape[-1]
+        offsets = np.broadcast_to(np.atleast_1d(theta_offset), (sig.shape[0],))
+        image = np.stack(
+            [
+                np.clip(s @ _flowline_colors(theta, sym_rotation_order, o), 0, 1)
+                for s, o in zip(sig, offsets)
+            ]
+        )
+        if white_background:
+            hsv = rgb_to_hsv(image)
+            hsv[..., 1], hsv[..., 2] = hsv[..., 2], 1.0
+            image = hsv_to_rgb(hsv)
+    return _finish(image, sum_radial_bins, white_background, plot_images)
 
 
 def make_flowline_combined_image(
     orient_flowlines,
-    int_range=[0, 0.2],
-    cvals=np.array(
-        [
-            [0.0, 0.7, 0.0],
-            [1.0, 0.0, 0.0],
-            [0.0, 0.7, 1.0],
-        ]
-    ),
+    int_range=(0.0, 0.2),
+    cvals=((0.0, 0.7, 0.0), (1.0, 0.0, 0.0), (0.0, 0.7, 1.0)),
     white_background=False,
     power_scaling=1.0,
     sum_radial_bins=True,
     plot_images=True,
-    figsize=None,
 ):
+    """RGB image of the flowlines with one colour per radial window.
+
+    Parameters
+    ----------
+    orient_flowlines : np.ndarray
+        Output of :func:`make_flowline_map`.
+    int_range : (float, float)
+        Flowline intensity (summed over theta) mapped to black and full colour.
+    cvals : array
+        ``(n, 3)`` RGB colour of each window.
+    white_background, power_scaling, sum_radial_bins, plot_images
+        As in :func:`make_flowline_rainbow_image`.
     """
-    Generate RGB output images from the flowline arrays.
+    sig = np.clip(
+        (orient_flowlines.sum(axis=-1) - int_range[0]) / (int_range[1] - int_range[0]), 0, 1
+    )
+    sig = sig[..., None] ** power_scaling
+    cvals = np.asarray(cvals, float)[: sig.shape[0], None, None, :]
+    image = 1 - sig * (1 - cvals) if white_background else sig * cvals
+    return _finish(image, sum_radial_bins, white_background, plot_images)
 
-    Args:
-        orient_flowline (array):    Histogram of all orientations with coordinates [x y radial_bin theta]
-                                    We assume theta bin ranges from 0 to 180 degrees and is periodic.
-        int_range (float)           2 element array giving the intensity range
-        cvals (array):              Nx3 size array containing RGB colors for different radial ibns.
-        white_background (bool):    For either color or greyscale output, switch to white background (from black).
-        power_scaling (float):      Power law scaling for flowline intensities.
-        sum_radial_bins (bool):     Sum outputs over radial bins.
-        plot_images (bool):         Plot the output images for quick visualization.
-        figsize (2-tuple):          Size of output figure.
 
-    Returns:
-        im_flowline (array):        flowline images
+def make_flowline_rainbow_legend(
+    im_size=256,
+    sym_rotation_order=2,
+    theta_offset=np.pi,
+    white_background=False,
+    radial_range=(0.45, 0.9),
+    plot_legend=True,
+):
+    """Colour wheel for :func:`make_flowline_rainbow_image`.
+
+    Each direction on the ring has the colour of a flowline running that way,
+    computed with the same colour function as the image.
+
+    Returns
+    -------
+    np.ndarray
+        ``(im_size, im_size, 3)`` RGB image.
     """
+    u = np.linspace(-1, 1, im_size)
+    row, col = np.meshgrid(u, u, indexing="ij")
+    radius = np.hypot(row, col)
+    inside = (radius > radial_range[0]) & (radius < radial_range[1])
+    # a line along direction psi is drawn for scattering at psi - 90 degrees
+    theta = np.mod(np.arctan2(row, col) - np.pi / 2, np.pi)
+    legend = _flowline_colors(theta, sym_rotation_order, theta_offset) * inside[..., None]
+    if white_background:
+        legend[~inside] = 1.0
+    if plot_legend:
+        _show_rgb(legend[None])
+    return legend
 
-    # init array
-    size_input = orient_flowlines.shape
-    size_output = np.array([size_input[0], size_input[1], size_input[2], 3])
-    im_flowline = np.zeros(size_output)
-    cvals = np.array(cvals)
 
-    # Generate all color images
-    for a0 in range(size_input[0]):
-        sig = np.clip(
-            (np.sum(orient_flowlines[a0, :, :, :], axis=2) - int_range[0])
-            / (int_range[1] - int_range[0]),
-            0,
-            1,
+# ---- helpers ----
+
+
+def _finish(image, sum_radial_bins, white_background, plot_images):
+    if sum_radial_bins:
+        image = (
+            image.min(axis=0, keepdims=True)
+            if white_background
+            else np.clip(image.sum(axis=0, keepdims=True), 0, 1)
         )
-        if power_scaling != 1:
-            sig = sig**power_scaling
+    if plot_images:
+        _show_rgb(image)
+    return image
 
-        if white_background:
-            im_flowline[a0, :, :, :] = 1 - sig[:, :, None] * (1 - cvals[a0, :][None, None, :])
-        else:
-            im_flowline[a0, :, :, :] = sig[:, :, None] * cvals[a0, :][None, None, :]
 
-        # # contrast flip
-        # if white_background is True:
-        #     im = rgb_to_hsv(im_flowline[a0,:,:,:])
-        #     # im_s = im[:,:,1]
-        #     im_v = im[:,:,2]
-        #     v_range = [np.min(im_v), np.max(im_v)]
-        #     print(v_range)
+def _show_rgb(images):
+    fig, axes = plt.subplots(1, len(images), figsize=(5 * len(images), 5), squeeze=False)
+    for ax, im in zip(axes[0], images):
+        ax.imshow(im)
+        ax.axis("off")
+    return fig, axes
 
-        #     im[:,:,1] = im_v
-        #     im[:,:,2] = 1
-        #     im_flowline[a0,:,:,:] = hsv_to_rgb(im)
 
-    if sum_radial_bins is True:
-        if white_background is False:
-            im_flowline = np.clip(np.sum(im_flowline, axis=0), 0, 1)[None, :, :, :]
-        else:
-            # im_flowline = np.clip(np.sum(im_flowline,axis=0)+1-im_flowline.shape[0],0,1)[None,:,:,:]
-            im_flowline = np.min(im_flowline, axis=0)[None, :, :, :]
+_PAD_MODES = {"nearest": "edge", "wrap": "wrap", "reflect": "symmetric"}
 
-    if plot_images is True:
-        if figsize is None:
-            fig, ax = plt.subplots(
-                im_flowline.shape[0], 1, figsize=(10, im_flowline.shape[0] * 10)
-            )
-        else:
-            fig, ax = plt.subplots(im_flowline.shape[0], 1, figsize=figsize)
 
-        if im_flowline.shape[0] > 1:
-            for a0 in range(im_flowline.shape[0]):
-                ax[a0].imshow(im_flowline[a0])
-                ax[a0].axis("off")
-            plt.subplots_adjust(wspace=0, hspace=0.02)
-        else:
-            ax.imshow(im_flowline[0])
-            ax.axis("off")
-        plt.show()
+def _gaussian_1d(array, sigma, axis, mode="reflect", truncate=4.0):
+    """Gaussian filter along one axis, as ``scipy.ndimage.gaussian_filter1d``."""
+    radius = int(truncate * sigma + 0.5)
+    x = torch.as_tensor(np.moveaxis(np.asarray(array, dtype=np.float64), axis, -1))
+    shape = x.shape
+    index = np.pad(np.arange(shape[-1]), radius, mode=_PAD_MODES[mode])
+    k = torch.exp(-0.5 * (torch.arange(-radius, radius + 1, dtype=x.dtype) / sigma) ** 2)
+    x = F.conv1d(x.reshape(-1, 1, shape[-1])[..., index], (k / k.sum()).view(1, 1, -1))
+    return np.moveaxis(x.reshape(shape).numpy(), -1, axis)
 
-    return im_flowline
+
+def _splat(hist, x, y, t, weight):
+    """Add ``weight`` trilinearly at fractional ``(x, y, t)``; t wraps."""
+    n_x, n_y, n_t = hist.shape
+    xf, yf, tf = np.floor(x).astype(int), np.floor(y).astype(int), np.floor(t).astype(int)
+    dx, dy, dt = x - xf, y - yf, t - tf
+    for ox, wx in ((0, 1 - dx), (1, dx)):
+        for oy, wy in ((0, 1 - dy), (1, dy)):
+            for ot, wt in ((0, 1 - dt), (1, dt)):
+                np.add.at(
+                    hist,
+                    (
+                        np.clip(xf + ox, 0, n_x - 1),
+                        np.clip(yf + oy, 0, n_y - 1),
+                        np.mod(tf + ot, n_t),
+                    ),
+                    weight * wx * wy * wt,
+                )
+
+
+def _interp(hist, x, y, t):
+    """Trilinear value of ``hist`` at ``(x, y, t)``; x, y clamp and t wraps."""
+    x, y = np.clip(x, 0, hist.shape[0] - 2), np.clip(y, 0, hist.shape[1] - 2)
+    xf, yf, tf = int(x), int(y), int(np.floor(t))
+    dx, dy, dt = x - xf, y - yf, t - tf
+    t0, t1 = tf % hist.shape[2], (tf + 1) % hist.shape[2]
+    block = hist[xf : xf + 2, yf : yf + 2][..., [t0, t1]]
+    w = np.einsum("i,j,k->ijk", [1 - dx, dx], [1 - dy, dy], [1 - dt, dt])
+    return float((block * w).sum())
+
+
+def _local_angle(orient, xy, t, dtheta, neighbourhood):
+    """Weighted mean orientation around ``(xy, t)``, unwrapped about ``t``."""
+    vx, vy, vt, kernel = neighbourhood
+    bins = np.round(t / dtheta).astype(int) + vt
+    crop = (
+        kernel
+        * orient[
+            np.clip(np.round(xy[0]).astype(int) + vx, 0, orient.shape[0] - 1),
+            np.clip(np.round(xy[1]).astype(int) + vy, 0, orient.shape[1] - 1),
+            np.mod(bins, orient.shape[2]),
+        ]
+    )
+    total = crop.sum()
+    return float((crop * bins * dtheta).sum() / total) if total > 0 else t
+
+
+def _trace(
+    orient,
+    flow,
+    xy0,
+    t0,
+    dtheta,
+    neighbourhood,
+    collision,
+    step,
+    sign,
+    thresh_grow,
+    thresh_collision,
+    max_steps,
+):
+    """Grow one flowline from a seed; returns ``(x, y, t_bin, value)`` per step."""
+    cx, cy, ct, mask = collision
+    xy, t, path = xy0.copy(), t0, []
+    for _ in range(max_steps):
+        xy = xy + sign * step * np.array([np.cos(t), -np.sin(t)])
+        if xy[0] < 0 or xy[1] < 0 or xy[0] > orient.shape[0] or xy[1] > orient.shape[1]:
+            break
+        value = _interp(orient, xy[0], xy[1], t / dtheta)
+        near = flow[
+            np.clip(np.round(xy[0]).astype(int) + cx, 0, orient.shape[0] - 1),
+            np.clip(np.round(xy[1]).astype(int) + cy, 0, orient.shape[1] - 1),
+            np.mod(np.round(t / dtheta).astype(int) + ct, orient.shape[2]),
+        ]
+        if value < thresh_grow or near[mask].max() > thresh_collision:
+            break
+        t = _local_angle(orient, xy, t, dtheta, neighbourhood)
+        path.append((xy[0], xy[1], t / dtheta, value))
+    return path

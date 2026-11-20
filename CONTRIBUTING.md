@@ -23,6 +23,17 @@ Getting started:
 
 The interactive visualization package is maintained separately in the [quantem.widget](https://github.com/electronmicroscopy/quantem.widget) repository. To run the widgets, follow its [installation guide](https://electronmicroscopy.github.io/quantem.widget/install.html). To contribute to the Python, TypeScript, or WebGPU widget code, clone that repository and follow its [contributing guide](https://github.com/electronmicroscopy/quantem.widget/blob/main/CONTRIBUTING.md) for the development setup and checks.
 
+#### What belongs in quantem.widget rather than quantem
+
+quantem holds analysis that produces data: detection, calibration, fitting and maps, with static `show_*` plots of the results, tested and saved with `AutoSerialize`. Code whose purpose is interaction or presentation goes in quantem.widget:
+
+- interactive viewers, editors and parameter-tuning panels, such as a scan-mask editor or an ice-threshold tuner
+- state and file formats that exist only for a user interface, such as the shape a mask was drawn from
+- caches that make cursor-driven updates fast
+- batch figure and animation export, such as multi-page PDFs and GIFs
+
+A widget calls quantem's public methods, and quantem never imports quantem.widget. When a feature needs both, put the computation in quantem behind a method the widget can call. For example, `BraggPeaksPolymer.find_peaks_model(positions=...)` gives a live viewer the same peaks as the full scan.
+
 The following will set up the pre-commit and [ruff](https://github.com/astral-sh/ruff) for linting and formatting. These commands only need to be run once when first setting up your dev environment: 
 
 - `uv tool install pre-commit` 
