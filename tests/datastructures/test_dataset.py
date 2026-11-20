@@ -193,6 +193,29 @@ class TestDatasetMethods:
         assert np.array_equal(sliced.origin, cropped.origin)
         assert np.array_equal(sliced.sampling, cropped.sampling)
 
+        # an increasing, evenly spaced index list, array or mask acts as the
+        # equivalent slice, and the metadata is kept
+        dset.metadata["rotation"] = 12.0
+        cases = [
+            ([4, 6, 8], (12, 20), (1.0, 2.0)),
+            (np.arange(4, 12, 2), (12, 20), (1.0, 2.0)),
+            ((np.arange(16) % 4 == 1, ...), (10.5, 20), (2.0, 2.0)),
+        ]
+        for index, origin, sampling in cases:
+            out = dset[index]
+            assert np.allclose(out.origin, origin), index
+            assert np.allclose(out.sampling, sampling), index
+            assert out.metadata.get("rotation") == 12.0, index
+
+        # the sampling stays positive, and a Dataset is a regular grid
+        for index, match in [
+            (np.s_[::-1], "positive"),
+            ([7, 6, 5, 4], "positive"),
+            ([0, 1, 5], "evenly spaced"),
+        ]:
+            with pytest.raises(IndexError, match=match):
+                dset[index]
+
     def test_getitem_slice_reduced_rank_updates_origin_and_sampling(self):
         """Test slicing before integer indexing updates remaining metadata."""
         dset = Dataset.from_array(

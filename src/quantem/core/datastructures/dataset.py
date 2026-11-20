@@ -907,12 +907,18 @@ class Dataset(AutoSerialize):
         General indexing method for Dataset objects.
 
         Returns a new Dataset (or subclass) corresponding to the indexed data.
-        Metadata (origin, sampling, units) is sliced or reduced accordingly.
-        Handles step slicing (e.g., [::2]) by multiplying sampling accordingly.
+        Every element keeps its coordinate, ``origin + i * sampling``: the
+        origin moves to the first selected element and the sampling is
+        multiplied by the step. The sampling stays positive, so a reversed
+        slice ([::-1]) or a decreasing index list raises IndexError;
+        orientation, such as the scan rotation and transpose of a 4D-STEM
+        dataset, belongs in the metadata. An index list or array along one
+        axis must be evenly spaced, since a Dataset describes a regular grid.
+        The metadata dict is copied.
 
         Parameters
         ----------
-        index : int | slice | tuple | Ellipsis
+        index : int | slice | list | ndarray | tuple | Ellipsis
             Indexing expression applied to the underlying array.
 
         Returns
@@ -926,15 +932,25 @@ class Dataset(AutoSerialize):
         if not isinstance(index, tuple):
             index = (index,)
 
-        # Expand Ellipsis
-        if Ellipsis in index:
-            ellipsis_pos = index.index(Ellipsis)
+        # Expand Ellipsis (`is` check: `in` compares index arrays elementwise)
+        ellipsis_pos = next((k for k, idx in enumerate(index) if idx is Ellipsis), None)
+        if ellipsis_pos is not None:
             num_missing = self.ndim - (len(index) - 1)
             index = index[:ellipsis_pos] + (slice(None),) * num_missing + index[ellipsis_pos + 1 :]
 
         # Pad with slices if index shorter than ndim
         if len(index) < self.ndim:
             index = index + (slice(None),) * (self.ndim - len(index))
+
+        # An evenly spaced index list or array is the equivalent slice
+        if sum(isinstance(idx, (list, np.ndarray)) and np.ndim(idx) > 0 for idx in index) > 1:
+            raise IndexError("Dataset indexing supports one index list or array; index .array")
+        index = tuple(
+            self._index_array_to_slice(idx, n)
+            if isinstance(idx, (list, np.ndarray)) and np.ndim(idx) > 0
+            else idx
+            for idx, n in zip(index, self.shape)
+        )
 
         # Compute which dimensions are kept
         kept_axes = [i for i, idx in enumerate(index) if not isinstance(idx, (int, np.integer))]
@@ -954,6 +970,11 @@ class Dataset(AutoSerialize):
             if isinstance(idx, slice) and i in kept_axis_to_index:
                 j = kept_axis_to_index[i]
                 normalized_start, _, normalized_step = idx.indices(self.shape[i])
+                if normalized_step < 0:
+                    raise IndexError(
+                        "Dataset sampling stays positive, so reversed slices and decreasing "
+                        "index lists are not supported; reverse .array instead"
+                    )
                 new_origin[j] = new_origin[j] + normalized_start * sampling_array[i]
                 if normalized_step != 1:
                     new_sampling[j] *= normalized_step
@@ -969,7 +990,7 @@ class Dataset(AutoSerialize):
                 cls = Dataset
 
         # Construct new dataset
-        return cls.from_array(  # type: ignore ## would be nice to properly type slicing, but hard
+        out = cls.from_array(  # type: ignore ## would be nice to properly type slicing, but hard
             array=array_view,
             name=f"{self.name}{index}",
             origin=new_origin,
@@ -977,6 +998,29 @@ class Dataset(AutoSerialize):
             units=new_units,
             signal_units=self.signal_units,
         )
+        # an increasing slice keeps the orientation, so the metadata stays valid
+        out.metadata.update(self.metadata)
+        return out
+
+    @staticmethod
+    def _index_array_to_slice(idx, n: int) -> slice:
+        """The slice that selects the same elements as an evenly spaced index list or array."""
+        idx = np.asarray(idx)
+        if idx.ndim != 1:
+            raise IndexError("Dataset indexing needs a 1D index list or array; index .array")
+        if idx.dtype == bool:
+            idx = np.flatnonzero(idx)
+        idx = np.where(idx < 0, idx + n, idx).astype(int)
+        if idx.size == 0:
+            raise IndexError("Dataset indexing needs a nonempty index list or array")
+        step = int(idx[1] - idx[0]) if idx.size > 1 else 1
+        if step == 0 or np.any(np.diff(idx) != step):
+            raise IndexError(
+                "Dataset indexing needs an evenly spaced index list or array, since a "
+                "Dataset describes a regular grid; index .array for other selections"
+            )
+        stop = int(idx[-1]) + step
+        return slice(int(idx[0]), stop if stop >= 0 else None, step)
 
     @classmethod
     def register_dimension(cls, ndim: int):
