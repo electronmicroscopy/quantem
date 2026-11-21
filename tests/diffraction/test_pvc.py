@@ -17,7 +17,6 @@ from quantem.diffraction.pvc import (
     PairVectorCorrelation,
     _cluster_power_sphere,
     _solve_sphere,
-    _ylm_azimuth_zero,
     order_parameter,
     pair_vector_marks,
 )
@@ -53,19 +52,25 @@ def _pvc(intensity, origin):
     )
 
 
-def test_sphere_solve_recovers_invariants_on_curved_ewald_sphere():
-    """S_n built from known B_l with the 200 kV Ewald geometry is inverted exactly."""
+def test_sphere_solve_recovers_invariants_without_folding():
+    """B_l up to l_max = 30 is recovered from the ring correlations
+    C(psi) = sum_l B_l P_l(cos gamma), on a flat and on the 200 kV Ewald sphere,
+    although C also holds an l = 0 background and orders up to 38, which fold
+    into the fitted orders of a fit to the harmonics n <= l_max."""
     q = np.linspace(0.3, 2.5, 5)
-    beta = np.pi / 2 + np.arcsin(0.02508 * q / 2)
-    ls = np.arange(2, 31, 2)
-    B = np.random.default_rng(0).normal(size=(ls.size, q.size, q.size))
-    B = B + B.transpose(0, 2, 1)
-    Y = _ylm_azimuth_zero(30, np.cos(beta)).numpy()
-    S = np.zeros((40, q.size, q.size))
-    for k, ell in enumerate(ls):
-        for n in range(ell + 1):
-            S[n] += 4 * np.pi / (2 * ell + 1) * np.outer(Y[ell, n], Y[ell, n]) * B[k]
-    assert np.abs(_solve_sphere(S, beta, ls) - B).max() < 1e-10
+    ls, l_all = np.arange(2, 31, 2), np.arange(0, 39, 2)
+    psi = 2 * np.pi * np.arange(128) / 128
+    rng = np.random.default_rng(0)
+    for wavelength in (0.0, 0.02508):
+        beta = np.pi / 2 + np.arcsin(wavelength * q / 2)
+        B = rng.normal(size=(l_all.size, q.size, q.size))
+        B = B + B.transpose(0, 2, 1)
+        cb, sb = np.cos(beta)[:, None, None], np.sin(beta)[:, None, None]
+        cos_gamma = cb * cb.transpose(1, 0, 2) + sb * sb.transpose(1, 0, 2) * np.cos(psi)
+        C = sum(B[k][:, :, None] * eval_legendre(ell, cos_gamma) for k, ell in enumerate(l_all))
+        S = np.fft.rfft(C, axis=-1).real.transpose(2, 0, 1)[:40] / psi.size
+        err = np.abs(_solve_sphere(S, beta, ls) - B[1 : ls.size + 1]).max()
+        assert err < 1e-10, f"wavelength {wavelength}: error {err:.1e}"
 
 
 def test_cluster_power_sphere_matches_addition_theorem():
@@ -176,36 +181,40 @@ def test_split_counts_removes_shot_noise_bias():
 
 
 def test_order_parameter_removes_noise_bias():
-    """Eight groups share a map that correlates about 0.6 with the reference, each
-    with independent noise three times its amplitude. The correlation of their
-    average is biased low by the noise; order_parameter recovers the true value
-    inside its confidence interval. The bin from 3.0 to 3.5 A, where the reference
-    is nearly flat and the signal does not follow it, is left out."""
+    """Eight groups share a distinct map and a self map, each group with noise
+    three times the distinct amplitude. The distinct fraction of their average
+    is biased toward 1 by the noise; order_parameter recovers the true value
+    inside its confidence interval. Points with a pair vector shorter than 2 A
+    hold 100 times more noise and are left out."""
     rng = np.random.default_rng(0)
     r, theta = np.arange(0, 4.05, 0.1), np.arange(0, 181.0)
-    reference = rng.normal(size=(r.size, r.size, theta.size))
-    r_eff, weight = np.maximum.outer(r, r), np.sin(np.deg2rad(theta))
-    reference[(r_eff >= 3.0) & (r_eff < 3.5)] *= 0.01
-    signal = 0.6 * reference + 0.8 * rng.normal(size=reference.shape)
-    groups = signal + 3.0 * rng.normal(size=(8, *reference.shape))
-    omega = order_parameter(groups, reference, r, theta, r_range=(2.0, 4.0), r_bin=0.5)
-    assert np.allclose(omega.r_eff, [2.25, 2.75, 3.75]), omega.r_eff
+    shape = (r.size, r.size, theta.size)
+    distinct, self_term = rng.normal(size=shape), 0.8 * rng.normal(size=shape)
+    noise = 3.0 * rng.normal(size=(8, *shape))
+    noise[:, np.minimum.outer(r, r) < 2.0] *= 100
+    groups, self_groups = distinct + noise, self_term + 0.1 * rng.normal(size=(8, *shape))
+    omega = order_parameter(groups, self_groups, r, theta, r_range=(2.0, 4.0), r_min=2.0)
+    assert np.allclose(omega.r_eff, [2.5, 3.5]), omega.r_eff
 
-    def corr(x, c):
-        """Correlation coefficient with each angle weighted by its solid angle."""
+    r_eff, r_short = np.maximum.outer(r, r), np.minimum.outer(r, r)
+    weight = np.sin(np.deg2rad(theta))
+
+    def variance(x):
+        """Variance over a bin with each angle weighted by its solid angle."""
         w = np.broadcast_to(weight, x.shape)
-        x, c = x - np.average(x, weights=w), c - np.average(c, weights=w)
-        return (w * x * c).sum() / np.sqrt((w * x * x).sum() * (w * c * c).sum())
+        return np.average((x - np.average(x, weights=w)) ** 2, weights=w)
 
     truth, naive = [], []
-    for lo in (2.0, 2.5, 3.5):
-        inside = (r_eff >= lo) & (r_eff < lo + 0.5)
-        truth.append(corr(signal[inside], reference[inside]))
-        naive.append(corr(groups.mean(0)[inside], reference[inside]))
+    for lo in (2.0, 3.0):
+        inside = (r_eff >= lo) & (r_eff < lo + 1) & (r_short >= 2.0)
+        d, s = variance(distinct[inside]), variance(self_term[inside])
+        truth.append(d / (d + s))
+        d, s = variance(groups.mean(0)[inside]), variance(self_groups.mean(0)[inside])
+        naive.append(d / (d + s))
     truth, naive = np.mean(truth), np.mean(naive)
     assert omega.interval[0] <= truth <= omega.interval[1], (omega.value, omega.interval, truth)
     assert abs(omega.value - truth) < 0.02, (omega.value, truth)
-    assert naive < truth - 0.1, (naive, truth)
+    assert naive > truth + 0.1, (naive, truth)
 
 
 def test_self_term_removal(triangular):

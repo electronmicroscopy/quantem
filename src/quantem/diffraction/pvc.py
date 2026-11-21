@@ -42,10 +42,11 @@ plot_correlation can add it back. The mean pattern holds the same two-body
 information (pair_distribution). A Gaussian damping of the radial weight keeps
 the ringing of sharp features below 1%.
 
-order_parameter measures how much of the angular order of a reference
-structure, usually the crystal of the same material, a sample keeps over
-distance: Omega is 1 for the reference and near 0 for a liquid. Its noise bias
-and confidence interval come from independent groups of patterns.
+order_parameter measures the crystalline ordering from the data alone: how
+much of the angular variance of Theta comes from distinct pair vectors rather
+than from the self term, over distance. Omega is near 1 for ordered regions as
+large as the illuminated volume and near 0.2 for a liquid. Its noise bias and confidence
+interval come from independent groups of patterns.
 
 The radial detector coordinate is |q| (1/A, no 2 pi). On the Ewald sphere the
 scattering vector makes the polar angle beta = 90 deg + asin(lambda |q| / 2)
@@ -58,10 +59,15 @@ so for the sphere model, exactly,
 
     S_n(k, k') = sum_l 4 pi / (2l + 1) Y_ln(beta, 0) Y_ln(beta', 0) B_l(q, q'),
 
-with B_l the rotational invariants of the 3D intensity, solved by least squares
-for each radius pair. No sin(theta) weights are needed, and the uncorrelated
-background (n = 0, l = 0) never enters. The output is a density per unit
-volume squared and per unit cos(theta), so it carries no |sin(theta)| factor.
+with B_l the rotational invariants of the 3D intensity. Summed over n, this is
+the angular correlation of the two rings, C(psi) = sum_l B_l P_l(cos gamma),
+with gamma the angle between the two scattering vectors. For each radius pair,
+B_l is fitted to C(psi) with the solid-angle weight d(cos gamma), in which the
+P_l are orthogonal, and an l = 0 term takes the uncorrelated background. Every
+harmonic n also holds all orders l >= n, which run to about 2 pi q times the
+cluster diameter, far above l_max; with this weight they do not fold into the
+fitted orders. The output is a density per unit volume squared and per unit
+cos(theta), so it carries no |sin(theta)| factor.
 """
 
 import warnings
@@ -103,7 +109,10 @@ class PairVectorCorrelation:
     ellipse_params : (a, b, theta_deg) or None
         Elliptical distortion, corrected in the polar transform.
     n_phi : int
-        Angular bins of the polar transform; harmonics up to n_phi // 2 - 1 are kept.
+        Angular bins of the polar transform; harmonics up to n_phi // 2 - 1 are
+        kept. The transform samples n_phi points on each ring, so too few bins
+        skip pixels at large radii and waste counts; 360 bins use most pixels
+        of a 256-pixel pattern.
     fq : callable, array or None
         Mean atomic scattering factor f(q), or a function of |q| (1/A). Patterns
         are divided by f(q)^2.
@@ -143,7 +152,7 @@ class PairVectorCorrelation:
         energy: float | None = None,
         origin=None,
         ellipse_params=None,
-        n_phi: int = 180,
+        n_phi: int = 360,
         fq=None,
         k_min: float | None = None,
         k_max: float | None = None,
@@ -827,9 +836,9 @@ def pair_vector_marks(
 
 
 class OrderParameter(NamedTuple):
-    """Result of order_parameter: Omega, its standard error and confidence
-    interval (by default the 10th to 90th percentile), and the bias-corrected
-    correlation (profile) in each r_eff bin."""
+    """Result of order_parameter: the crystalline ordering Omega, its standard
+    error and confidence interval (by default the 10th to 90th percentile), and
+    the ordering rho_b in each r_eff bin."""
 
     value: float
     standard_error: float
@@ -840,80 +849,75 @@ class OrderParameter(NamedTuple):
 
 def order_parameter(
     Theta_groups,
-    Theta_reference,
+    Theta_self_groups,
     r,
     theta_deg,
-    r_range: tuple[float, float] = (2.0, 10.0),
+    r_range: tuple[float, float] = (5.0, 10.0),
+    r_min: float = 2.0,
     r_bin: float = 1.0,
-    min_structure: float = 0.2,
     confidence: float = 0.8,
 ) -> OrderParameter:
     """
-    Order parameter Omega of a sample relative to a reference structure, usually
-    the perfect crystal of the same material, with a confidence interval.
+    Crystalline ordering Omega from the data alone: the fraction of the angular
+    variance of the PVC that comes from correlations between distinct pair
+    vectors, rather than from each pair vector correlated with itself.
 
-    Each point (r, r', theta) of a map correlates two pair vectors, and r_eff =
-    max(r, r') is the length of the longer one: the distance over which the
-    point tests the order. The points are grouped into bins of r_eff, and in
-    each bin Omega compares the shape of the sample's pair vector correlation
-    with the reference's: the correlation coefficient of the two maps over
-    (r, r', theta). r_eff is a label for each point, not a cutoff; only r_range
-    limits it, and its upper end must fit inside the illuminated volume. Theta is a density per unit solid angle,
-    so each angle is weighted by its solid angle, sin(theta); on a uniform grid
-    in theta, the few pair vectors near 0 and 180 deg would otherwise count as
-    much as the many near 90 deg. Maps of the beam model, with dphi from 0 to
-    360 deg, are weighted uniformly. Omega is the mean over the bins. It is 1
-    when the angular order of the reference persists over the whole range, and
-    near 0 when the sample has no angular order beyond the shortest distances.
+    Each point (r, r', theta) correlates two pair vectors, and r_eff =
+    max(r, r') is the distance over which it tests the order. The points are
+    sorted into bins of r_eff, and in each bin
 
-    The correlation coefficient ignores amplitude, so a bin in which the
-    reference is nearly flat would count as much as any other, while its value
-    is set by small residuals. Bins whose reference RMS is below min_structure
-    times the median over the bins are left out. Bins narrower than the spacing
-    of the neighbor shells alternate between bins that hold a shell and bins
-    between shells, which makes the profile oscillate; crystalline Si, for
-    example, has no pair vectors between 2.35 and 3.84 A, and a bin from 3.0 to
-    3.5 A holds only the tails of the neighboring shells. With the default 1 A
-    bins, every bin of Si holds at least one shell.
+        rho_b = D_b / (D_b + S_b),
 
-    Noise adds power to the sample's map but does not correlate with the
-    reference, so the correlation of a single map is biased toward 0. The
-    patterns are therefore split into K independent groups, for example
-    contiguous blocks of the scan larger than the grain size, each solved by
-    correlation() with the same settings. The squared norm of the sample's
-    correlation is estimated from the products of different groups, whose noise
-    is independent, which removes the bias. Leaving out one group at a time
-    (jackknife) gives the standard error, and the interval uses Student's t with
-    K - 1 degrees of freedom, clipped to [-1, 1]. The default confidence of 0.8
-    gives the 10th to 90th percentile. A wide interval means that the
-    groups disagree: the data cannot measure Omega at that dose and number of
+    where D_b and S_b are the variances of Theta (distinct pair vectors) and of
+    Theta_self over the bin, about their means, with each angle weighted by its
+    solid angle, sin(theta) (beam maps, from 0 to 360 deg, are weighted
+    uniformly). Omega is the mean of rho_b over the bins. It is near 1 when the
+    sample keeps the orientation of its pair vectors over r_eff, as a crystal
+    does, and near 0.2 for a liquid. The default r_range starts beyond the
+    first few neighbor shells, at about twice the nearest-neighbor distance of
+    Si: closer in, each pair vector has few distinct partners, and even a
+    perfect crystal keeps much of its variance in the self term (rho_b of 0.3
+    to 0.8 for Si from 2 to 5 A). Only points where both pair vectors are at
+    least r_min long are used, since shorter than the nearest-neighbor distance
+    the maps hold only noise. Bins narrower than the spacing of the neighbor
+    shells alternate between bins that hold a shell and bins between shells;
+    with 1 A bins every bin of Si holds a shell.
+
+    Noise adds variance that looks like order. The patterns are therefore split
+    into K independent groups (contiguous blocks of the scan larger than the
+    grains), each solved by correlation() with the same settings, and D_b and
+    S_b are averaged over the products of different groups, whose noise is
+    independent. Negative values of D_b and S_b, from noise, are set to 0, so
+    that rho_b stays between 0 and 1. Leaving out one group
+    at a time (jackknife) gives the standard error, and the interval uses
+    Student's t with K - 1 degrees of freedom, clipped to [0, 1]. A wide
+    interval means the data cannot measure Omega at that dose and number of
     patterns.
 
-    Theta_groups : sequence of K >= 3 arrays (Nr, Nr, Ntheta), one per group.
-    Theta_reference : array (Nr, Nr, Ntheta) of the reference on the same grid,
-        free of noise and processed like the data: model_correlation of the
-        reference structure, or correlation() of patterns simulated with the
-        probe and partial coherence of the experiment.
-    r, theta_deg : grids of the maps, the r and theta_deg of correlation().
-    r_range, r_bin : bins of r_eff (A).
-    min_structure : smallest reference RMS of a bin, relative to the median bin.
+    Theta_groups, Theta_self_groups : K >= 3 maps (Nr, Nr, Ntheta) each, the
+        Theta and Theta_self of correlation() for each group.
+    r, theta_deg : grids of the maps.
+    r_range, r_bin : bins of r_eff (A); r_range[1] must fit inside the
+        illuminated volume and the r grid of the maps.
+    r_min : shortest pair vector used (A), about the nearest-neighbor distance.
     confidence : of the interval, 0.8 for the 10th to 90th percentile.
 
     Example, with 16 blocks of a 256 x 256 scan ds:
 
         blocks = [ds[i : i + 64, j : j + 64] for i in range(0, 256, 64) for j in range(0, 256, 64)]
-        groups = [PairVectorCorrelation(b, fq=f, k_min=0.1) for b in blocks]
+        groups = [PairVectorCorrelation(b, fq=f, k_min=0.1, split_counts=True) for b in blocks]
         maps = [g.correlation("sphere", r_max=10.0)[1] for g in groups]
-        reference = groups[0].model_correlation(crystal_clusters)
-        omega = order_parameter(maps, reference, groups[0].r, groups[0].theta_deg)
+        omega = order_parameter(maps, [g.Theta_self for g in groups], groups[0].r, groups[0].theta_deg)
     """
-    G = torch.as_tensor(np.stack([np.asarray(T) for T in Theta_groups]), dtype=torch.float64)
-    C = torch.as_tensor(np.asarray(Theta_reference), dtype=torch.float64)
-    K = G.shape[0]
+    T, S = (
+        torch.as_tensor(np.stack([np.asarray(x) for x in maps]), dtype=torch.float64)
+        for maps in (Theta_groups, Theta_self_groups)
+    )
+    K = T.shape[0]
     if K < 3:
         raise ValueError(f"order_parameter needs at least 3 groups, got {K}")
-    if G.shape[1:] != C.shape:
-        raise ValueError(f"group maps {tuple(G.shape[1:])} and reference {tuple(C.shape)} differ")
+    if T.shape != S.shape:
+        raise ValueError(f"Theta {tuple(T.shape)} and Theta_self {tuple(S.shape)} differ")
     theta = torch.as_tensor(np.asarray(theta_deg), dtype=torch.float64)
     if theta.max() <= 180:
         weight = torch.sin(torch.deg2rad(theta)).clamp(min=0)  # solid angle on the sphere
@@ -922,46 +926,32 @@ def order_parameter(
     root = torch.sqrt(weight / weight.mean())
 
     def centered(x):
-        """Values of one bin (..., n, Ntheta) minus their weighted mean, times sqrt(weight)."""
+        """Values of one bin (K, n, Ntheta) minus their weighted mean, times sqrt(weight)."""
         mean = (x * weight).sum((-2, -1), keepdim=True) / (weight.sum() * x.shape[-2])
-        return (x - mean) * root
+        return ((x - mean) * root).reshape(K, -1)
 
     r = torch.as_tensor(np.asarray(r), dtype=torch.float64)
     r_eff = torch.maximum(r[:, None], r[None, :])
+    r_short = torch.minimum(r[:, None], r[None, :])
     n_bins = int(round((r_range[1] - r_range[0]) / r_bin))
     edges = r_range[0] + r_bin * np.arange(n_bins + 1)
-
-    bins = [(r_eff >= lo) & (r_eff < hi) for lo, hi in zip(edges[:-1], edges[1:])]
-    rms = torch.stack(
-        [
-            centered(C[inside]).pow(2).mean().sqrt() if inside.any() else torch.zeros(())
-            for inside in bins
-        ]
-    )
-    if not (rms > 0).any():
-        raise ValueError("no r_eff bin of r_range holds reference structure")
-    enough = (rms > 0) & (rms >= min_structure * rms[rms > 0].median())
-
-    # per bin: products of the centered group maps with each other and with the reference
-    stats, centers = [], []
-    for inside, lo, use in zip(bins, edges[:-1], enough):
-        if not use:
-            continue
-        c = centered(C[inside]).reshape(-1)
-        g = centered(G[:, inside]).reshape(K, -1)
-        stats.append((g @ g.T, g @ c, c @ c))
-        centers.append(lo + 0.5 * r_bin)
+    grams = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        inside = (r_eff >= lo) & (r_eff < hi) & (r_short >= r_min)
+        if not inside.any():
+            raise ValueError(f"the r_eff bin from {lo:g} to {hi:g} A holds no points of the maps")
+        g, s = centered(T[:, inside]), centered(S[:, inside])
+        grams.append((g @ g.T, s @ s.T))
 
     def profile(w):
-        """Correlation per bin from the groups with weights w (0 leaves a group out)."""
+        """rho_b from the groups with weights w (0 leaves a group out)."""
         W = torch.outer(w, w)
         W.fill_diagonal_(0.0)  # products of different groups only
         out = []
-        for M, v, cc in stats:
-            num = w @ v / w.sum()  # <signal, reference>: noise averages out
-            norm = (W * M).sum() / W.sum()  # |signal|^2 without the noise power
-            den = torch.sqrt(cc * torch.clamp(norm, min=num**2 / cc))  # |correlation| <= 1
-            out.append(num / den if den > 0 else torch.zeros((), dtype=torch.float64))
+        for G, Sg in grams:
+            d = torch.clamp((W * G).sum() / W.sum(), min=0.0)
+            total = d + torch.clamp((W * Sg).sum() / W.sum(), min=0.0)
+            out.append(d / total if total > 0 else torch.zeros((), dtype=torch.float64))
         return torch.stack(out)
 
     full = profile(torch.ones(K, dtype=torch.float64))
@@ -971,11 +961,8 @@ def order_parameter(
     )
     se = float(torch.sqrt((K - 1) / K * ((jack - jack.mean()) ** 2).sum()))
     t = float(stdtrit(K - 1, 0.5 + 0.5 * confidence))
-    interval = (max(value - t * se, -1.0), min(value + t * se, 1.0))
-    return OrderParameter(value, se, interval, np.array(centers), full.numpy())
-
-
-# ---------------------------------------------------------------------- helpers
+    interval = (max(value - t * se, 0.0), min(value + t * se, 1.0))
+    return OrderParameter(value, se, interval, 0.5 * (edges[:-1] + edges[1:]), full.numpy())
 
 
 def _split_counts(item, origin, gen):
@@ -1041,46 +1028,41 @@ def _order_taper(orders, order_max):
     return np.cos(0.5 * np.pi * np.asarray(orders, dtype=np.float64) / order_max) ** 2
 
 
-def _ylm_azimuth_zero(l_max, cos_beta):
-    """Orthonormal Y_lm(beta, 0) for 0 <= m <= l <= l_max, as an (l_max + 1, l_max + 1, N) array [l, m]."""
-    x = torch.as_tensor(np.asarray(cos_beta), dtype=torch.float64)
-    s = torch.sqrt(torch.clamp(1 - x**2, min=0))
-    Y = torch.zeros((l_max + 1, l_max + 1, x.numel()), dtype=torch.float64)
-    p_mm = torch.full_like(x, (1 / (4 * np.pi)) ** 0.5)
-    for m in range(l_max + 1):
-        if m > 0:
-            p_mm = -(((2 * m + 1) / (2 * m)) ** 0.5) * s * p_mm
-        Y[m, m] = p_mm
-        if m == l_max:
-            break
-        p_prev, p_l = p_mm, (2 * m + 3) ** 0.5 * x * p_mm
-        Y[m + 1, m] = p_l
-        for ell in range(m + 2, l_max + 1):
-            a = ((4 * ell * ell - 1) / (ell * ell - m * m)) ** 0.5
-            b = (((ell - 1) ** 2 - m * m) / (4 * (ell - 1) ** 2 - 1)) ** 0.5
-            p_prev, p_l = p_l, a * (x * p_l - b * p_prev)
-            Y[ell, m] = p_l
-    return Y
-
-
 def _solve_sphere(S, beta, l_values):
     """
     Least-squares B_l(q, q') for each radius pair from the real second moment
-    S (n, k, k'), using the harmonics n = 1 ... l_max (n = 0 holds the l = 0
-    background and is not used).
+    S (n, k, k'), n = 0 ... n_max. The angular correlation of the rings k and k',
+    C(psi) = S_0 + 2 sum_n S_n cos(n psi), equals sum_l B_l P_l(cos gamma) with
+    cos gamma = cos(beta) cos(beta') + sin(beta) sin(beta') cos(psi). The even
+    orders up to n_max (or l_max, if larger) and l = 0 are fitted to C with the
+    solid-angle weight d(cos gamma), on Gauss-Legendre nodes in cos(psi) that
+    integrate every harmonic of S exactly, and the orders l_values are returned.
+    The weight keeps orders above the fit from folding into the fitted ones (on
+    a flat Ewald sphere the P_l are orthogonal), and the extra orders up to n_max
+    absorb what the curved sphere, whose cones miss the angles near 180 deg,
+    would otherwise leak.
     """
-    l_max = int(l_values[-1])
-    n_values = np.arange(1, min(l_max, S.shape[0] - 1) + 1)
-    Y = _ylm_azimuth_zero(l_max, np.cos(beta))[torch.as_tensor(l_values)][
-        :, torch.as_tensor(n_values)
-    ]  # (Nl, Nn, Nk)
-    c = torch.as_tensor(4 * np.pi / (2 * l_values + 1), dtype=torch.float64)
-    S_t = torch.from_numpy(np.ascontiguousarray(S[n_values]))  # (Nn, Nk, Nk)
-    n_k = S.shape[1]
+    l_values = np.asarray(l_values)
+    n_max, n_k = S.shape[0] - 1, S.shape[1]
+    l_top = max(int(l_values[-1]), n_max - n_max % 2)
+    l_fit = np.arange(0, l_top + 1, 2)
+    keep = torch.as_tensor(np.searchsorted(l_fit, l_values))
+    t, w = np.polynomial.legendre.leggauss((n_max + l_top) // 2 + 2)
+    t, root = torch.from_numpy(t), torch.from_numpy(np.sqrt(w))
+    n = torch.arange(n_max + 1, dtype=torch.float64)
+    T = torch.cos(n[None, :] * torch.arccos(t)[:, None]) * torch.where(n == 0, 1.0, 2.0)
+    C = torch.einsum("jn,nkp->jkp", T, torch.from_numpy(np.ascontiguousarray(S)))  # (J, Nk, Nk)
+    beta = torch.as_tensor(np.asarray(beta), dtype=torch.float64)
+    cb, sb = torch.cos(beta), torch.sin(beta)
     B = torch.zeros((len(l_values), n_k, n_k), dtype=torch.float64)
     for k in range(n_k):
-        A = torch.einsum("l,lnj,ln->jnl", c, Y, Y[:, :, k])  # (Nk', Nn, Nl)
-        B[:, k, :] = torch.linalg.lstsq(A, S_t[:, k, :].T[:, :, None]).solution[:, :, 0].T
+        x = cb[k] * cb[:, None] + sb[k] * sb[:, None] * t[None, :]  # (Nk', J) cos(gamma)
+        P = [torch.ones_like(x), x]
+        for ell in range(1, l_top):
+            P.append(((2 * ell + 1) * x * P[ell] - ell * P[ell - 1]) / (ell + 1))
+        A = torch.stack([P[int(ell)] for ell in l_fit], -1) * root[None, :, None]
+        b = (C[:, k, :].T * root[None, :])[:, :, None]
+        B[:, k, :] = torch.linalg.lstsq(A, b).solution[:, keep, 0].T
     return B.numpy()
 
 
