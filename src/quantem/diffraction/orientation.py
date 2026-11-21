@@ -114,6 +114,70 @@ def scan_scalebar(metadata: dict) -> dict | None:
     return {"sampling": step, "units": units}
 
 
+def with_scan_calibration(scalebar, calibration: dict | None):
+    """Fill a requested scale bar's sampling and units from the scan.
+
+    Parameters
+    ----------
+    scalebar : bool | "auto" | dict | ScalebarConfig | None
+        The scale bar asked for. True and "auto" mean the scan calibration
+        as it stands; a dict or ScalebarConfig that does not set its own
+        sampling and units takes them from `calibration`. None or False
+        draws no bar.
+    calibration : dict | None
+        :func:`scan_scalebar` of the scan, or None when it was never
+        calibrated.
+
+    Returns
+    -------
+    bool | dict | ScalebarConfig | None
+        A scale bar any quantem plot accepts, or None for no bar.
+
+    Raises
+    ------
+    ValueError
+        If `scalebar` is an unknown string.
+
+    Warns
+    -----
+    UserWarning
+        When a scale bar is asked for on an uncalibrated scan without its own
+        sampling and units: it is drawn in pixels, and any `display_units`
+        is dropped.
+    """
+    from dataclasses import replace
+
+    from quantem.core.visualization.visualization_utils import (
+        _fill_scalebar_calibration,
+        _resolve_scalebar,
+        _scalebar_display_units,
+        _scalebar_lacks_calibration,
+        _warn_from_caller,
+    )
+
+    if isinstance(scalebar, str):
+        if scalebar != "auto":
+            raise ValueError(
+                f"scalebar must be 'auto', True, a dict or a ScalebarConfig, got {scalebar!r}"
+            )
+        scalebar = True
+    if calibration is not None:
+        return _fill_scalebar_calibration(scalebar, calibration["sampling"], calibration["units"])
+    if scalebar is True:
+        return None
+    if _scalebar_lacks_calibration(scalebar):
+        display_units = _scalebar_display_units(scalebar)
+        dropped = f"; display_units={display_units!r} is ignored" if display_units else ""
+        _warn_from_caller(
+            f"This scan has no length calibration, so the scale bar is drawn in pixels"
+            f"{dropped}. Set dataset.sampling and dataset.units before detecting the "
+            "Bragg disks, or give 'sampling' and 'units' in the scale bar."
+        )
+        if display_units:
+            scalebar = replace(_resolve_scalebar(scalebar), display_units=None)
+    return scalebar
+
+
 def smooth_quaternions(
     quats: torch.Tensor,
     active: torch.Tensor,
@@ -2731,6 +2795,15 @@ class OrientationMap(AutoSerialize):
         md = self.metadata.get("peaks", {}) or {}
         return scan_scalebar(md)
 
+    def _scalebar_with_calibration(self, scalebar):
+        """Fill a requested scale bar's sampling and units from the scan.
+
+        A dict, ScalebarConfig or True that does not set its own sampling
+        and units takes them from :attr:`scan_scalebar`; see
+        :func:`with_scan_calibration`.
+        """
+        return with_scan_calibration(scalebar, self.scan_scalebar)
+
     def plot_orientation(self, direction: str = "z", match: int = 0, **kwargs):
         """IPF-colored orientation map with the color wedge beside it.
 
@@ -2755,7 +2828,7 @@ class OrientationMap(AutoSerialize):
         """
         from quantem.diffraction.orientation_visualization import plot_orientation_map
 
-        kwargs.setdefault("scalebar", self.scan_scalebar)
+        kwargs["scalebar"] = self._scalebar_with_calibration(kwargs.get("scalebar", True))
         return plot_orientation_map(
             self, direction=direction, match=match, **self._default_mask(kwargs)
         )
@@ -2803,7 +2876,7 @@ class OrientationMap(AutoSerialize):
         """
         from quantem.diffraction.orientation_visualization import plot_cluster_map
 
-        kwargs.setdefault("scalebar", self.scan_scalebar)
+        kwargs["scalebar"] = self._scalebar_with_calibration(kwargs.get("scalebar", True))
         return plot_cluster_map(self, clusters, **kwargs)
 
     def plot_cluster_pole_figure(self, clusters: dict, pole=(0, 0, 1), **kwargs):

@@ -6,7 +6,10 @@ import numpy as np
 import torch
 
 from quantem.core.utils.rotations import quat_to_matrix
-from quantem.core.visualization.visualization_utils import add_scalebar_to_ax
+from quantem.core.visualization.visualization_utils import (
+    _resolve_scalebar,
+    add_scalebar_to_ax,
+)
 from quantem.diffraction.crystal import Crystal
 
 # one color per candidate phase, used consistently across every plot; index
@@ -361,12 +364,46 @@ def wedge_legend(
     ax.axis("off")
 
 
+def _draw_map_scalebar(ax, scalebar, shape) -> None:
+    """Draw a scale bar on a scan map from any form `scalebar` may take.
+
+    Accepts None/False (no bar), True, a dict of :class:`ScalebarConfig`
+    fields, a ScalebarConfig or a ``ShowParams.Scalebar``. Every field is
+    honored. With no width_px set, the bar is 1/40 of the map height thick,
+    since a one-pixel bar is invisible on a scan; any width_px given,
+    including 1, is used as it is.
+    """
+    cfg = _resolve_scalebar(scalebar)
+    if cfg is None:
+        return
+    width_px = shape[0] / 40 if cfg.width_px is None else cfg.width_px
+    add_scalebar_to_ax(
+        ax,
+        array_size=shape[1],
+        sampling=cfg.sampling,
+        length_units=cfg.length,
+        units=cfg.units,
+        width_px=width_px,
+        pad_px=cfg.pad_px,
+        color=cfg.color,
+        loc=cfg.loc,
+        fontsize=cfg.fontsize,
+        bold=cfg.bold,
+        box=cfg.box,
+        box_color=cfg.box_color,
+        box_alpha=cfg.box_alpha,
+        outline_color=cfg.outline_color,
+        outline_width=cfg.outline_width,
+        display_units=cfg.display_units,
+    )
+
+
 def plot_orientation_map(
     om,
     direction: str = "z",
     match: int = 0,
     mask: np.ndarray | None = None,
-    scalebar: dict | None = None,
+    scalebar=None,
     figax=None,
     legend: bool = True,
     axsize: tuple[float, float] = (9.0, 4.5),
@@ -427,8 +464,9 @@ def plot_orientation_map(
         Colorfulness relative to the corner colors: 1 keeps them exact, lower
         washes the map toward white.
         The legend is drawn with the same values.
-    scalebar : dict | None
-        Real-space scale bar, e.g. {"sampling": 30, "units": "A"}.
+    scalebar : bool | dict | ScalebarConfig | None
+        Real-space scale bar: True, a ScalebarConfig, or a dict of its
+        fields, e.g. {"sampling": 30, "units": "A", "loc": "lower left"}.
     crop : (r0, r1, c0, c1) | None
         Show only this window of the map (rows r0:r1, columns c0:c1).
     title : str | None
@@ -501,18 +539,7 @@ def plot_orientation_map(
             ax.set_title(f"{om.crystal.name}  in-plane orientation  ({direction:g}\u00b0)")
         else:
             ax.set_title(f"{om.crystal.name}  in-plane orientation")
-    if scalebar is not None:
-        add_scalebar_to_ax(
-            ax,
-            array_size=rgb.shape[1],
-            sampling=scalebar.get("sampling", 1.0),
-            length_units=scalebar.get("length", None),
-            units=scalebar.get("units", "pixels"),
-            width_px=rgb.shape[0] / 40,
-            pad_px=rgb.shape[0] / 80,
-            color=scalebar.get("color", "white"),
-            loc="lower right",
-        )
+    _draw_map_scalebar(ax, scalebar, rgb.shape)
     if legend and ax_leg is not None:
         wedge_legend(
             om.crystal,
@@ -855,7 +882,7 @@ def plot_cluster_map(
     om,
     clusters: dict,
     colors: np.ndarray | None = None,
-    scalebar: dict | None = None,
+    scalebar=None,
     figax=None,
 ):
     """Map of orientation clusters (variants), one color per cluster.
@@ -870,8 +897,9 @@ def plot_cluster_map(
         Output of :meth:`OrientationMap.cluster_orientations`.
     colors : sequence | None
         One color per cluster, cycled; defaults to `CLUSTER_COLORS`.
-    scalebar : dict | None
-        Real-space scale bar, e.g. {"sampling": 30, "units": "A"}.
+    scalebar : bool | dict | ScalebarConfig | None
+        Real-space scale bar: True, a ScalebarConfig, or a dict of its
+        fields, e.g. {"sampling": 30, "units": "A", "loc": "lower left"}.
     figax : (fig, ax) | None
         Existing axes to draw into.
 
@@ -910,18 +938,7 @@ def plot_cluster_map(
         for k in range(K)
     ]
     ax.legend(handles=handles, loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=8)
-    if scalebar is not None:
-        add_scalebar_to_ax(
-            ax,
-            array_size=rgb.shape[1],
-            sampling=scalebar.get("sampling", 1.0),
-            length_units=scalebar.get("length", None),
-            units=scalebar.get("units", "pixels"),
-            width_px=rgb.shape[0] / 40,
-            pad_px=rgb.shape[0] / 80,
-            color=scalebar.get("color", "white"),
-            loc="lower right",
-        )
+    _draw_map_scalebar(ax, scalebar, rgb.shape)
     return fig, ax
 
 
@@ -1014,6 +1031,28 @@ def _pole_scatter_xy(quats: torch.Tensor, crystal: Crystal, pole) -> np.ndarray:
     return np.stack((x, y), axis=1)
 
 
+def _draw_scan_axes_glyph(ax) -> None:
+    """Scan-axes arrows in the top-left corner of a pole figure.
+
+    Pole figures are drawn in the scan (image) frame of the orientation maps:
+    c (column) rightward and r (row) downward, so the y axis is inverted.
+    """
+    gx, gy = -1.06, -1.06
+    for dx, dy, lbl, ha, va in (
+        (0.22, 0.0, "c", "left", "center"),
+        (0.0, 0.22, "r", "center", "top"),
+    ):
+        ax.annotate(
+            "",
+            xy=(gx + dx, gy + dy),
+            xytext=(gx, gy),
+            arrowprops=dict(arrowstyle="-|>", color="0.3", lw=1.2),
+            annotation_clip=False,
+        )
+        ax.text(gx + dx * 1.25, gy + dy * 1.25, lbl, fontsize=9, ha=ha, va=va, color="0.3")
+    ax.text(gx - 0.03, gy - 0.06, "scan axes", fontsize=7, ha="left", va="bottom", color="0.45")
+
+
 def plot_cluster_pole_figure(
     om,
     clusters: dict,
@@ -1024,6 +1063,10 @@ def plot_cluster_pole_figure(
     figax=None,
 ):
     """Pole figure of the cluster mean orientations, one color per cluster.
+
+    Drawn in the scan frame, the same as :func:`plot_pole_figure`: the scan
+    column axis c to the right and the row axis r downward, so the two
+    figures can be compared or overlaid directly.
 
     Also available as :meth:`OrientationMap.plot_cluster_pole_figure`.
 
@@ -1074,9 +1117,10 @@ def plot_cluster_pole_figure(
     K = clusters["mean_quats"].shape[0]
     for k in range(K):
         xy = _pole_scatter_xy(clusters["mean_quats"][k], om.crystal, pole)
+        # scan frame, as in plot_pole_figure: c (lab y) across, r (lab x) down
         ax.scatter(
-            xy[:, 0],
             xy[:, 1],
+            xy[:, 0],
             s=60,
             marker="h",
             color=colors[k % len(colors)],
@@ -1087,8 +1131,8 @@ def plot_cluster_pole_figure(
     if overlay is not None:
         xy = _pole_scatter_xy(overlay["quats"], overlay["crystal"], overlay["pole"])
         ax.scatter(
-            xy[:, 0],
             xy[:, 1],
+            xy[:, 0],
             s=70,
             marker="D",
             facecolors="none",
@@ -1096,8 +1140,9 @@ def plot_cluster_pole_figure(
             lw=1.0,
             label=overlay.get("label", "overlay"),
         )
+    _draw_scan_axes_glyph(ax)
     ax.set_xlim(-1.15, 1.15)
-    ax.set_ylim(-1.15, 1.15)
+    ax.set_ylim(1.2, -1.15)
     ax.set_aspect("equal")
     ax.set_xticks([])
     ax.set_yticks([])
@@ -1268,38 +1313,7 @@ def plot_pole_figure(
         for az in range(0, 180, 30):
             ca, sa = np.cos(np.deg2rad(az)), np.sin(np.deg2rad(az))
             ax.plot([-ca, ca], [-sa, sa], color="0.85", lw=0.4)
-        # compact scan-axes glyph, top-left corner: the pole figure is in
-        # the scan (image) frame -- c rightward, r downward
-        gx, gy = -1.06, -1.06
-        for dx, dy, lbl, ha, va in (
-            (0.22, 0.0, "c", "left", "center"),
-            (0.0, 0.22, "r", "center", "top"),
-        ):
-            ax.annotate(
-                "",
-                xy=(gx + dx, gy + dy),
-                xytext=(gx, gy),
-                arrowprops=dict(arrowstyle="-|>", color="0.3", lw=1.2),
-                annotation_clip=False,
-            )
-            ax.text(
-                gx + dx * 1.25,
-                gy + dy * 1.25,
-                lbl,
-                fontsize=9,
-                ha=ha,
-                va=va,
-                color="0.3",
-            )
-        ax.text(
-            gx - 0.03,
-            gy - 0.06,
-            "scan axes",
-            fontsize=7,
-            ha="left",
-            va="bottom",
-            color="0.45",
-        )
+        _draw_scan_axes_glyph(ax)
     if overlay is not None:
         if "om" in overlay:
             # raw-histogram contour of another map's pole family

@@ -512,7 +512,7 @@ class PhaseMap(AutoSerialize):
         shade_gamma: float = 1.0,
         majority_filter: int = 0,
         reliability_range: tuple[float, float] | None = None,
-        scalebar: dict | str | None = "auto",
+        scalebar="auto",
         figax=None,
     ):
         """Dominant-phase map: color gives the crystal, brightness the evidence.
@@ -553,11 +553,13 @@ class PhaseMap(AutoSerialize):
         reliability_range : tuple | None
             Backwards-compatible shortcut: setting it selects
             ``shade_by="reliability"`` with this range.
-        scalebar : dict | "auto" | None
-            Real-space scale bar. "auto" (the default) takes the scan step
-            and units carried from the dataset by the orientation maps; a
-            dict such as {"sampling": 30, "units": "A"} overrides it, and
-            None draws no bar.
+        scalebar : "auto" | bool | dict | ScalebarConfig | None
+            Real-space scale bar. "auto" (the default) or True takes the
+            scan step and units carried from the dataset by the orientation
+            maps. A dict of ScalebarConfig fields or a ScalebarConfig
+            changes any of them, e.g. {"display_units": "nm", "loc": "lower
+            left"}, and keeps the scan calibration unless it sets its own
+            sampling and units. None or False draws no bar.
         figax : (fig, ax) | None
             Existing axes to draw into.
 
@@ -571,12 +573,15 @@ class PhaseMap(AutoSerialize):
         ValueError
             If `shade_by` is unknown or `shade_gamma` is not positive.
         """
-        if isinstance(scalebar, str):
-            scalebar = self.orientation_maps[0].scan_scalebar if scalebar == "auto" else None
         import matplotlib.pyplot as plt
 
-        from quantem.core.visualization.visualization_utils import add_scalebar_to_ax
-        from quantem.diffraction.orientation_visualization import phase_color_cycle
+        from quantem.diffraction.orientation import with_scan_calibration
+        from quantem.diffraction.orientation_visualization import (
+            _draw_map_scalebar,
+            phase_color_cycle,
+        )
+
+        scalebar = with_scan_calibration(scalebar, self.orientation_maps[0].scan_scalebar)
 
         assert self.phase_index is not None and self.reliability is not None
         phase_colors = phase_color_cycle(len(self.names), phase_colors)
@@ -627,18 +632,7 @@ class PhaseMap(AutoSerialize):
         ax.imshow(rgb, interpolation="nearest")
         ax.set_xticks([])
         ax.set_yticks([])
-        if scalebar is not None:
-            add_scalebar_to_ax(
-                ax,
-                array_size=rgb.shape[1],
-                sampling=scalebar.get("sampling", 1.0),
-                length_units=scalebar.get("length", None),
-                units=scalebar.get("units", "pixels"),
-                width_px=rgb.shape[0] / 40,
-                pad_px=rgb.shape[0] / 80,
-                color=scalebar.get("color", "white"),
-                loc="lower right",
-            )
+        _draw_map_scalebar(ax, scalebar, rgb.shape)
         handles = [
             plt.Line2D([0], [0], marker="s", ls="", color=c, label=n)
             for c, n in zip(phase_colors, self.names)

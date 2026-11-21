@@ -537,7 +537,9 @@ class CrystalMap(AutoSerialize):
         if crop and m.any():
             rows, cols = np.nonzero(m)
             sl = (slice(rows.min(), rows.max() + 1), slice(cols.min(), cols.max() + 1))
-        kwargs.setdefault("scalebar", self.orientation_maps[0].scan_scalebar)
+        kwargs["scalebar"] = self.orientation_maps[0]._scalebar_with_calibration(
+            kwargs.get("scalebar", True)
+        )
         if strain:
             comps = {k: v.numpy()[sl] for k, v in maps["strain"].items()}
             return bloch.plot_strain_crystal_frame(comps, mask=m[sl], **kwargs)
@@ -750,9 +752,8 @@ class CrystalMap(AutoSerialize):
             positions without moving a real boundary.
         phase_colors : np.ndarray, optional
             One RGB color per crystal.
-        scalebar : dict, "auto" or None, default="auto"
-            Real-space scale bar; "auto" takes the scan step carried by the
-            peaks.
+        scalebar : "auto", bool, dict, ScalebarConfig or None, default="auto"
+            Real-space scale bar; see :meth:`PhaseMap.plot_phase`.
         **kwargs
             Further arguments of :meth:`PhaseMap.plot_phase`.
 
@@ -1220,9 +1221,14 @@ class CrystalMap(AutoSerialize):
                 [f"{n} reliability" for n in self.names],
             ],
         )
-        sb = self.orientation_maps[0].scan_scalebar
-        if sb is not None:
-            kwargs.setdefault("scalebar", [[sb] + [False] * (len(corr) - 1), [False] * len(corr)])
+        # one bar, on the first panel; a nested list is taken as given
+        sb = kwargs.get("scalebar", True)
+        if not isinstance(sb, (list, tuple)):
+            sb = self.orientation_maps[0]._scalebar_with_calibration(sb)
+            if sb is None:
+                kwargs.pop("scalebar", None)
+            else:
+                kwargs["scalebar"] = [[sb] + [False] * (len(corr) - 1), [False] * len(corr)]
         return show_2d([corr, rel], **kwargs)
 
     def _phase_indices(self, phase) -> list[int]:

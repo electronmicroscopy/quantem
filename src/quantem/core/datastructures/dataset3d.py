@@ -10,7 +10,10 @@ from quantem.core.datastructures.dataset import Dataset
 from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization import show_2d
 from quantem.core.visualization.custom_normalizations import NormalizationConfig
-from quantem.core.visualization.visualization_utils import ScalebarConfig
+from quantem.core.visualization.visualization_utils import (
+    ScalebarConfig,
+    _fill_scalebar_calibration,
+)
 
 # show_2d keywords that set the normalization; same_scale leaves them alone
 _NORM_KEYS = ("norm", *(f.name for f in fields(NormalizationConfig)))
@@ -348,6 +351,10 @@ class Dataset3d(Dataset):
         ):
             vmin, vmax = np.nanquantile(np.stack(images[:n_frames]), [0.02, 0.98])
             kwargs["vmin"], kwargs["vmax"] = float(vmin), float(vmax)
+        # the frames go to show_2d as plain arrays, so carry the calibration
+        scalebar = _fill_scalebar_calibration(
+            scalebar, float(self.sampling[-1]), str(self.units[-1])
+        )
         fig, axes = show_2d(image_grid, scalebar=scalebar, title=label_grid, **kwargs)
         if pad_count > 0:
             for ax in np.array(axes).flat[-pad_count:]:
