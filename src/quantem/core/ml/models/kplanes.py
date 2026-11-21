@@ -525,7 +525,7 @@ class KPlanesTILTED(KPlanes):
     def extract_tau_state(self) -> torch.Tensor:
         """
         Returns the current raw R^9 matrices (detached copy) so they can be
-        used to initialise a phase-2 model via `load_tau_state`.
+        used to initialize a phase-2 model via `load_tau_state`.
 
         Returns
         -------

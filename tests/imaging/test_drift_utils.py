@@ -1,4 +1,4 @@
-"""Parity tests for drift_utils.py torch functions.
+"""Parity tests for Drift Torch numerical helpers.
 
 Tests the core building blocks against numpy/scipy equivalents.
 The full pipeline is covered by frozen baselines in test_drift.py.
@@ -10,18 +10,19 @@ import torch
 from scipy.ndimage import gaussian_filter
 
 from quantem.core.utils.imaging_utils import bilinear_kde, fourier_cropping
-from quantem.imaging.drift import _bounded_sine_sigmoid_torch, _fourier_crop_torch
-from quantem.imaging.drift import bounded_sine_sigmoid
-from quantem.imaging.drift_utils import (
-    _parabolic_peak_2d,
-    _parabolic_sub_pixel,
+from quantem.imaging.drift.apply import fourier_crop_torch
+from quantem.imaging.drift.core.knots import (
     _symmetric_pad,
     bilinear_kde_batch,
-    cross_corr_batch,
     gaussian_smooth_1d,
     gaussian_smooth_batch,
 )
-
+from quantem.imaging.drift.core.warping import (
+    _parabolic_peak_2d,
+    _parabolic_sub_pixel,
+    _translation_from_cross_correlation,
+    cross_corr_batch,
+)
 
 # ---------------------------------------------------------------------------
 # High-level: cross-correlation and warping
@@ -41,6 +42,38 @@ def test_cross_corr_zero_cost_for_identical():
     reference = torch.tensor(image)[None]
     cost = cross_corr_batch(reference, reference.clone(), upsample_factor=8)
     assert cost.item() < 1e-6
+
+
+@pytest.mark.parametrize("device", [
+    "cpu",
+    pytest.param("mps", marks=pytest.mark.skipif(
+        not torch.backends.mps.is_available(), reason="MPS unavailable")),
+    pytest.param("cuda", marks=pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="CUDA unavailable")),
+])
+def test_dft_shift_with_bright_background(device):
+    """Recover signed fractional shifts with either zero or large image means."""
+    shape = (55, 72)
+    image = gaussian_filter(np.random.default_rng(18).normal(size=shape), 1.5, mode="wrap")
+    shifts = np.array([[2.73, -15.49], [-4.21, 7.65]])
+    row = np.fft.fftfreq(shape[0])[:, None]
+    col = np.fft.fftfreq(shape[1])
+    phase = shifts[:, 0, None, None] * row + shifts[:, 1, None, None] * col
+    moving = np.fft.ifft2(np.fft.fft2(image) * np.exp(-2j * np.pi * phase)).real
+
+    for background in (0.0, 400.0):
+        ref = torch.tensor(image + background, device=device, dtype=torch.float32)
+        mov = torch.tensor(moving + background, device=device, dtype=torch.float32)
+        spectrum = torch.fft.fft2(ref) * torch.fft.fft2(mov).conj()
+        recovered = _translation_from_cross_correlation(spectrum, 8, None)
+        np.testing.assert_allclose(recovered.cpu(), -shifts, atol=0.002, rtol=0)
+
+
+def test_dft_constant_images_have_zero_shift():
+    images = torch.full((1, 32, 32), 400.0)
+    spectrum = torch.fft.fft2(images).abs().square().to(torch.complex64)
+    shift = _translation_from_cross_correlation(spectrum, 8, None)
+    torch.testing.assert_close(shift, torch.zeros_like(shift))
 
 
 @pytest.mark.parametrize("shift_row,shift_col", [(0, 0), (3, -5), (7, 2), (2.3, -1.7)])
@@ -191,27 +224,8 @@ def test_parabolic_sub_pixel_exact():
 
 
 # ---------------------------------------------------------------------------
-# generate_corrected helpers: torch parity against numpy originals
+# Corrected-output Fourier helper parity against NumPy
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("midpoint,width", [(0.5, 1.0), (0.3, 0.4), (0.7, 0.5)])
-def test_bounded_sine_sigmoid_torch_matches_numpy(midpoint, width):
-    """Torch sigmoid helper must match the numpy original point-for-point.
-
-    bounded_sine_sigmoid is the Fourier low-pass weight ramp used in
-    generate_corrected(). A mismatch would apply different weighting
-    to the merged output than the numpy path.
-    """
-    rng = np.random.default_rng(0)
-    x = rng.random(256).astype(np.float32)
-    expected = bounded_sine_sigmoid(x, midpoint=midpoint, width=width).astype(np.float32)
-    result = _bounded_sine_sigmoid_torch(
-        torch.tensor(x), midpoint=midpoint, width=width
-    ).numpy()
-    np.testing.assert_allclose(result, expected, atol=1e-6,
-        err_msg=f"Sigmoid mismatch at midpoint={midpoint}, width={width}")
-
 
 @pytest.mark.parametrize("input_shape,crop_shape", [
     ((64, 64), (32, 32)),
@@ -228,7 +242,7 @@ def test_fourier_crop_torch_matches_numpy(input_shape, crop_shape):
     rng = np.random.default_rng(1)
     arr = (rng.random(input_shape) + 1j * rng.random(input_shape)).astype(np.complex64)
     expected = fourier_cropping(arr, crop_shape)
-    result = _fourier_crop_torch(
+    result = fourier_crop_torch(
         torch.tensor(arr), crop_shape
     ).numpy()
     np.testing.assert_allclose(result, expected, atol=1e-6,
