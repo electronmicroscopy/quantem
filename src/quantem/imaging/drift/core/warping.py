@@ -20,7 +20,7 @@ import math
 
 import numpy as np
 import torch
-from torch.fft import fft2, fftfreq, ifft2, ifftshift
+from torch.fft import fft2, fftfreq, ifft2
 from tqdm.auto import tqdm
 
 from quantem.imaging.drift.core import knots as drift_knots
@@ -963,6 +963,10 @@ def _translation_from_cross_correlation(
     # Keep every solver on one integer → parabolic → DFT refinement and the
     # same centered (row, col) shift convention.
     num_images, num_rows, num_cols = cross_corr_fft.shape
+    # DC adds the same offset at every lag. Removing it preserves the small
+    # peak differences in float32 for scans with a large intensity baseline.
+    cross_corr_fft = cross_corr_fft.clone()
+    cross_corr_fft[:, 0, 0] = 0
     cross_corr = ifft2(cross_corr_fft).real
     if max_shift_mask is not None:
         fill = cross_corr.flatten(1).min(dim=1).values[:, None, None]
@@ -982,7 +986,9 @@ def _translation_from_cross_correlation(
         )
     shifts[:, 0] = ((shifts[:, 0] + num_rows / 2) % num_rows) - num_rows / 2
     shifts[:, 1] = ((shifts[:, 1] + num_cols / 2) % num_cols) - num_cols / 2
-    return shifts
+    # A constant correlation contains no translation information.
+    flat = cross_corr.amax(dim=(-2, -1)) == cross_corr.amin(dim=(-2, -1))
+    return torch.where(flat[:, None], 0.0, shifts)
 
 
 def _dft_refine_shifts(
@@ -1083,33 +1089,24 @@ def _dft_upsample_batch(
         where ``P = 2 * ceil(1.5 * upsample_factor) + 1``.
 
     """
-    num_test_drifts, num_rows, num_cols = cross_corr_fft.shape
-    real_dtype = torch.float32 if cross_corr_fft.dtype == torch.complex64 else torch.float64
-    # 1.5x radius ensures the patch captures the true peak after parabolic shift
-    patch_radius = math.ceil(1.5 * upsample_factor)
-    # Upsampled grid positions centered at zero: [-radius, ..., 0, ..., +radius]
-    upsample_grid = torch.arange(-patch_radius, patch_radius + 1, dtype=real_dtype, device=cross_corr_fft.device)
-    # ifftshift reorders [0,1,...,N-1] to match FFT output ordering,
-    # then subtract N//2 to center at zero
-    freq_row_base = ifftshift(
-        torch.arange(num_rows, dtype=real_dtype, device=cross_corr_fft.device)
-    ) - num_rows // 2
-    freq_col_base = ifftshift(
-        torch.arange(num_cols, dtype=real_dtype, device=cross_corr_fft.device)
-    ) - num_cols // 2
-    freq_row = freq_row_base[None, :] + (peak_positions[:, 0] - num_rows // 2)[:, None]
-    freq_col = freq_col_base[None, :] + (peak_positions[:, 1] - num_cols // 2)[:, None]
-    # Guizar-Sicairos matrix-multiply DFT: K_row @ CC @ K_col
-    kern_row = torch.exp(
-        -2j * math.pi / (num_rows * upsample_factor)
-        * upsample_grid[None, :, None] * freq_row[:, None, :]
-    ).to(cross_corr_fft.dtype)  # real → complex for matrix multiply
-    kern_col = torch.exp(
-        -2j * math.pi / (num_cols * upsample_factor)
-        * freq_col[:, :, None] * upsample_grid[None, None, :]
-    ).to(cross_corr_fft.dtype)  # real → complex for matrix multiply
-    # (N,P,M) @ (N,M,K) @ (N,K,P) -> (N,P,P)
-    return (kern_row @ cross_corr_fft @ kern_col).real
+    _, num_rows, num_cols = cross_corr_fft.shape
+    device = cross_corr_fft.device
+    dtype = cross_corr_fft.real.dtype
+    radius = math.ceil(1.5 * upsample_factor)
+    offsets = torch.arange(-radius, radius + 1, device=device, dtype=dtype) / upsample_factor
+
+    # Sample the inverse DFT at lag = coarse peak + fractional offset.
+    # Signed lags keep the phase arguments small near the periodic boundary.
+    def kernel(peaks: torch.Tensor, length: int) -> torch.Tensor:
+        centers = torch.where(peaks > length / 2, peaks - length, peaks)
+        lags = centers[:, None] + offsets
+        frequencies = fftfreq(length, device=device, dtype=dtype)
+        return torch.exp(2j * math.pi * lags[:, :, None] * frequencies)
+
+    rows = kernel(peak_positions[:, 0], num_rows)
+    cols = kernel(peak_positions[:, 1], num_cols)
+    return (rows @ cross_corr_fft @ cols.transpose(-1, -2)).real
+
 
 def _parabolic_peak_2d(
     cross_corr: torch.Tensor,

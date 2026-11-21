@@ -20,6 +20,7 @@ from quantem.imaging.drift.core.knots import (
 from quantem.imaging.drift.core.warping import (
     _parabolic_peak_2d,
     _parabolic_sub_pixel,
+    _translation_from_cross_correlation,
     cross_corr_batch,
 )
 
@@ -41,6 +42,38 @@ def test_cross_corr_zero_cost_for_identical():
     reference = torch.tensor(image)[None]
     cost = cross_corr_batch(reference, reference.clone(), upsample_factor=8)
     assert cost.item() < 1e-6
+
+
+@pytest.mark.parametrize("device", [
+    "cpu",
+    pytest.param("mps", marks=pytest.mark.skipif(
+        not torch.backends.mps.is_available(), reason="MPS unavailable")),
+    pytest.param("cuda", marks=pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="CUDA unavailable")),
+])
+def test_dft_shift_with_bright_background(device):
+    """Recover signed fractional shifts with either zero or large image means."""
+    shape = (55, 72)
+    image = gaussian_filter(np.random.default_rng(18).normal(size=shape), 1.5, mode="wrap")
+    shifts = np.array([[2.73, -15.49], [-4.21, 7.65]])
+    row = np.fft.fftfreq(shape[0])[:, None]
+    col = np.fft.fftfreq(shape[1])
+    phase = shifts[:, 0, None, None] * row + shifts[:, 1, None, None] * col
+    moving = np.fft.ifft2(np.fft.fft2(image) * np.exp(-2j * np.pi * phase)).real
+
+    for background in (0.0, 400.0):
+        ref = torch.tensor(image + background, device=device, dtype=torch.float32)
+        mov = torch.tensor(moving + background, device=device, dtype=torch.float32)
+        spectrum = torch.fft.fft2(ref) * torch.fft.fft2(mov).conj()
+        recovered = _translation_from_cross_correlation(spectrum, 8, None)
+        np.testing.assert_allclose(recovered.cpu(), -shifts, atol=0.002, rtol=0)
+
+
+def test_dft_constant_images_have_zero_shift():
+    images = torch.full((1, 32, 32), 400.0)
+    spectrum = torch.fft.fft2(images).abs().square().to(torch.complex64)
+    shift = _translation_from_cross_correlation(spectrum, 8, None)
+    torch.testing.assert_close(shift, torch.zeros_like(shift))
 
 
 @pytest.mark.parametrize("shift_row,shift_col", [(0, 0), (3, -5), (7, 2), (2.3, -1.7)])
