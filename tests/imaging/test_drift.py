@@ -203,21 +203,26 @@ def test_nonrigid_diagnostic_defines_fast_roughness():
 
 def test_paired_position_plot_uses_native_sites_and_measured_scan_directions():
     first, second = _orthogonal_pair()
-    for scan in (first, second):
-        scan.metadata["upsample"] = 2
+    for scan, angle in zip((first, second), (25, 115), strict=True):
+        scan.metadata.update(upsample=2, scan_rotation_deg=angle)
     drift = DriftCorrection.from_images(first, second, device="cpu")
     drift.preprocess(show_combined=False, show_knots=False, verbose=False)
-    fig, (before, after) = drift.plot_probe_positions(image_index=(0, 1), stride=4, zoom=4)
+    fig, axes = drift.plot_probe_positions(image_index=(0, 1), stride=4, zoom=4)
     try:
-        for i, arrow in enumerate(before.texts):
-            sites = drift.probe_positions(i, corrected=False)
-            row, col = sites[0, -1] - sites[0, 0]
-            expected = np.array([col, -row])
-            np.testing.assert_allclose(np.subtract(arrow.xy, arrow.xyann), 0.13 * expected / np.linalg.norm(expected), atol=1e-6)
-            np.testing.assert_allclose(before.lines[i].get_xdata(), sites[::4, ::4, 1].ravel() / 0.8, atol=1e-5)
-        assert len(before.texts) == 2 and not after.texts
-        assert np.isclose(np.diff(before.get_xlim()).item(), first.shape[1] / 4)
-        assert before.get_ylim() == after.get_ylim() and before.yaxis_inverted()
+        for i, ax in enumerate(axes):
+            nominal = drift.probe_positions(i, corrected=False)
+            fitted = drift.probe_positions(i)
+            for line, sites in zip(ax.lines, (nominal, fitted), strict=True):
+                sites_px = sites[::4, ::4] / 0.8
+                np.testing.assert_allclose(line.get_xdata(), sites_px[..., 1].ravel(), atol=1e-5)
+                np.testing.assert_allclose(line.get_ydata(), sites_px[..., 0].ravel(), atol=1e-5)
+            row, col = nominal[0, -1] - nominal[0, 0]
+            expected = 0.046 * np.array([col, -row]) / np.hypot(row, col)
+            arrow = ax.texts[-1]
+            np.testing.assert_allclose(np.subtract(arrow.xy, arrow.xyann), expected, atol=1e-6)
+            assert ax.get_title() == f"{drift.scan_direction_degrees[i]:g}° scan"
+        assert np.isclose(np.diff(axes[0].get_xlim()).item(), first.shape[1] / 4)
+        assert axes[0].get_ylim() == axes[1].get_ylim() and axes[0].yaxis_inverted()
     finally:
         plt.close(fig)
 

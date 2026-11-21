@@ -135,7 +135,7 @@ def plot_probe_positions(
     axsize: tuple[float, float] = (5.0, 4.8),
     cmap: str = "viridis",
 ) -> tuple[Figure, np.ndarray]:
-    """Plot nominal and drift-updated probe positions for one scan image.
+    """Plot nominal and drift-updated probe positions in a common frame.
 
     The positions remain indexed like the raw scan: point ``(r, c)`` belongs
     to the raw diffraction pattern at ``dataset[r, c]``. The corrected
@@ -146,9 +146,9 @@ def plot_probe_positions(
     Parameters
     ----------
     image_index : int or tuple of int, default 0
-        One scan shows its position overlay and displacement vectors. Two indices
-        compare nominal and fitted rasters side by side. Arrows in the nominal
-        panel indicate the direction of increasing acquisition column.
+        One scan shows its position overlay and displacement vectors. A tuple
+        compares the update for each scan on shared axes. Each arrow runs
+        from a nominal probe site to its fitted position.
     zoom : float, default 1
         Magnification about the field center. Displacements remain to scale.
     stride : int, default 16
@@ -172,7 +172,7 @@ def plot_probe_positions(
     --------
     >>> figure, axes = drift.plot_probe_positions(image_index=1, stride=8)
     """
-    from quantem.imaging.drift.fourdstem import _canvas_positions
+    from quantem.imaging.drift.fourdstem import _canvas_positions, _sampling_angstrom
 
     if stride < 1:
         raise ValueError("stride must be >= 1")
@@ -187,38 +187,51 @@ def plot_probe_positions(
             i < 0 or i >= len(self.imgs) for i in image_index
         ):
             raise ValueError("Choose distinct scan indices for the paired view.")
-        fig, axes = plt.subplots(1, 2, sharex=True, sharey=True, figsize=(2 * axsize[0], axsize[1]))
-        before, after = axes
-        for slot, i in enumerate(image_index):
-            marker = ("o", "x", "+", "s")[slot % 4]
-            color = f"C{slot % 10}"
-            step = stride * self.imgs[i].metadata.get("upsample", 1)
-            label = f"Scan {i}: {self.scan_direction_degrees[i]:g}°"
-            for ax, corrected in ((before, False), (after, True)):
-                sites = _canvas_positions(self, i, corrected, strip_padding)
-                points = sites[::step, ::step]
-                ax.plot(points[..., 1].ravel(), points[..., 0].ravel(), linestyle="none",
-                        marker=marker, markerfacecolor="none", color=color, label=label, markersize=5)
-                if not corrected:
-                    # Draw a direction key in axes coordinates; row increases downward.
-                    row, col = sites[0, -1] - sites[0, 0]
-                    direction = np.array([col, -row])
-                    length = np.linalg.norm(direction)
-                    if length:
-                        start = np.array([(slot + 0.3) / len(image_index), 0.85])
-                        before.annotate("", xy=start + 0.13 * direction / length, xytext=start,
-                                        xycoords="axes fraction",
-                                        arrowprops=dict(arrowstyle="-|>", color=color, lw=2.5))
-        before.set(title="Nominal positions · fast-scan arrows", ylabel="Row (px)")
-        if zoom != 1:
-            before.set(xlim=xlim, ylim=ylim)
+        fig, axes = plt.subplots(
+            1, len(image_index), sharex=True, sharey=True,
+            figsize=(len(image_index) * axsize[0], axsize[1]), layout="constrained",
+        )
+        sampling_A = _sampling_angstrom(self.imgs[0])
+        for ax, i in zip(axes, image_index, strict=True):
+            nominal = self.probe_positions(i, corrected=False, strip_padding=strip_padding) / sampling_A
+            fitted = self.probe_positions(i, strip_padding=strip_padding) / sampling_A
+            sites = nominal[::stride, ::stride]
+            updated = fitted[::stride, ::stride]
+            delta = updated - sites
+            # Include the entire field even when the last site misses the display stride.
+            for grid in (nominal, fitted):
+                ax.update_datalim([
+                    (grid[..., 1].min(), grid[..., 0].min()),
+                    (grid[..., 1].max(), grid[..., 0].max()),
+                ])
+            ax.plot(sites[..., 1].ravel(), sites[..., 0].ravel(), "o", ms=3.4,
+                    mfc="none", mec="0.50", mew=0.7, label="Nominal")
+            ax.quiver(sites[..., 1], sites[..., 0], delta[..., 1], delta[..., 0],
+                      angles="xy", scale_units="xy", scale=1, pivot="tail",
+                      color="0.38", width=0.0025, minlength=0)
+            ax.plot(updated[..., 1].ravel(), updated[..., 0].ravel(), ".", ms=4,
+                    color="C0", label="Fitted")
+            ax.set(title=f"{self.scan_direction_degrees[i]:g}° scan", xlabel="Column (px)",
+                   aspect="equal")
+            # Keep the fast-scan key outside the data so it cannot be mistaken for drift.
+            row, col = nominal[0, -1] - nominal[0, 0]
+            length = np.hypot(row, col)
+            if length:
+                center = np.array([0.96, 1.025])
+                offset = 0.023 * np.array([col, -row]) / length
+                ax.text(0.92, center[1], "Fast scan", transform=ax.transAxes,
+                        ha="right", va="center", fontsize="small")
+                ax.annotate("", xy=center + offset, xytext=center - offset,
+                            xycoords="axes fraction", annotation_clip=False,
+                            arrowprops=dict(arrowstyle="-|>", color="0.3", lw=1.5))
+        axes[0].set_ylabel("Row (px)")
+        if zoom == 1:
+            axes[0].autoscale_view()
+            axes[0].invert_yaxis()
         else:
-            before.invert_yaxis()
-        after.set_title("Fitted positions")
-        for ax in axes:
-            ax.set(xlabel="Column (px)", aspect="equal")
-        fig.legend(*before.get_legend_handles_labels(), loc="upper center", ncol=2)
-        fig.tight_layout(rect=(0, 0, 1, 0.91))
+            axes[0].set(xlim=xlim, ylim=ylim)
+        fig.legend(*axes[0].get_legend_handles_labels(), loc="outside lower center",
+                   ncols=2, frameon=False)
         return fig, axes
     nominal = _canvas_positions(
         self, image_index,
@@ -627,7 +640,13 @@ def plot_combined(
         # A combined registration comparison is a clean scientific result,
         # not a general-purpose image-editing workspace. Callers can still opt
         # back into the full interface with ui_mode="interactive".
-        show_kwargs.setdefault("ui_mode", "report")
+        ui_mode = show_kwargs.pop("ui_mode", "report")
+        if hasattr(Show2D, "columns"):
+            show_kwargs.update(columns=len(stage_names), panel_width_px=int(width) if width else None)
+            show_kwargs.setdefault("mode", ui_mode)
+        else:
+            show_kwargs.update(ncols=len(stage_names), size=int(width) if width else 0)
+            show_kwargs.setdefault("ui_mode", ui_mode)
         if rgb:
             # Overlay is already percentile-normalized on a shared scale.
             # Contrast knobs would only confuse an RGB registration view.
@@ -640,8 +659,6 @@ def plot_combined(
             labels=labels,
             sampling=sampling,
             units=unit,
-            ncols=len(stage_names),
-            size=int(width) if width else 0,
             display_bin=display_bin,
             zoom=zoom,
             center=center,
@@ -1015,16 +1032,17 @@ def show(
     from quantem.widget import Show2D
 
     panels = drift_apply.comparison_panels(self)
+    if hasattr(Show2D, "columns"):
+        layout = dict(columns=panels["ncols"], panel_gap_px=0, panel_width_px=size, mode=mode)
+    else:
+        layout = dict(ncols=panels["ncols"], gallery_gap_px=0, size=size, ui_mode=mode)
     return Show2D(
         panels["images"],
-        ncols=panels["ncols"],
-        gallery_gap_px=0,
-        size=size,
-        pixel_size=panels["pixel_size"],
-        pixel_unit=panels["pixel_unit"],
+        sampling=panels["pixel_size"],
+        units=panels["pixel_unit"],
         labels=panels["labels"],
         zoom=zoom,
-        ui_mode=mode,
+        **layout,
         **kwargs,
     )
 
@@ -1067,14 +1085,18 @@ def show_4dstem(
     )
     kwargs.setdefault("title", "4D-STEM affine drift correction")
     kwargs.setdefault("frame_dim_label", "Processing stage")
-    kwargs.setdefault("compare_cols", 3)
     kwargs.setdefault("compare_max_panels", 3)
     kwargs.setdefault("compare_dp_mode", "selected")
-    kwargs.setdefault(
-        "sampling",
-        (float(sampling[0]), float(sampling[1]), float(det_bin), float(det_bin)),
-    )
-    kwargs.setdefault("units", [units[0], units[1], "pixels", "pixels"])
+    if hasattr(Show4DSTEM, "compare_columns"):
+        kwargs.setdefault("compare_columns", 3)
+        if "ui_mode" in kwargs:
+            kwargs.setdefault("mode", kwargs.pop("ui_mode"))
+        if units[0] == units[1] == "nm":
+            kwargs.setdefault("scan_sampling_A", tuple(float(v) * 10 for v in sampling))
+    else:
+        kwargs.setdefault("compare_cols", 3)
+        kwargs.setdefault("sampling", (*sampling[:2], det_bin, det_bin))
+        kwargs.setdefault("units", [*units[:2], "pixels", "pixels"])
 
     viewer = Show4DSTEM(
         fourdstem.corrected_4dstem_views(self, det_bin=det_bin),

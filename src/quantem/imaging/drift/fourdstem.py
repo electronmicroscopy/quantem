@@ -95,20 +95,17 @@ def integrate_virtual_detector(
     --------
     >>> adf = integrate_virtual_detector(data, detector_mask=annulus)
     """
-    try:
-        from quantem.gpu.detector import masked_sum
-    except ModuleNotFoundError as exc:
-        if exc.name not in {"quantem.gpu", "quantem.gpu.detector"}:
-            raise
-        masked_sum = None
+    from quantem.core.datastructures.dataset import Dataset
 
+    if isinstance(dataset, Dataset):
+        dataset = dataset.array if dataset.array is not None else dataset.tensor
     if reduce not in {"mean", "sum"}:
         raise ValueError(f"reduce must be 'mean' or 'sum', got {reduce!r}")
     scan_shape = tuple(int(value) for value in dataset.shape[:2])
     detector_shape = tuple(int(value) for value in dataset.shape[2:])
     if len(detector_shape) == 1:
         detector_shape = (1, detector_shape[0])
-        dataset = dataset.reshape(-1, *detector_shape)
+        dataset = dataset.reshape(*scan_shape, *detector_shape)
     elif len(detector_shape) != 2:
         raise ValueError(
             "integrate_virtual_detector expects (row, col, channel) or "
@@ -122,25 +119,41 @@ def integrate_virtual_detector(
     num_selected = int(mask.sum())
     if num_selected == 0:
         raise ValueError("detector_mask selects zero detector pixels")
-    if isinstance(dataset, np.ndarray) and np.issubdtype(
-        dataset.dtype,
-        np.floating,
-    ):
-        flat = dataset.reshape(*scan_shape, -1)
-        image = flat[..., mask.reshape(-1)].sum(axis=-1, dtype=np.float32)
-    elif masked_sum is not None:
+    if is_loaded_4dstem(dataset):
+        from quantem.gpu.detector import masked_sum
+
         image = masked_sum(dataset, mask).reshape(scan_shape)
     elif isinstance(dataset, torch.Tensor):
-        mask_t = torch.as_tensor(mask, device=dataset.device)
-        flat = dataset.reshape(*scan_shape, -1).to(torch.float32)
-        image = flat[..., mask_t.reshape(-1)].sum(-1).detach().cpu().numpy()
+        flat = dataset.reshape(*scan_shape, -1)
+        indices = None
+        if num_selected != mask.size:
+            indices = torch.as_tensor(np.flatnonzero(mask), device=dataset.device)
+        accum_dtype = torch.float32 if flat.is_floating_point() else torch.int64
+        if flat.device.type == "mps" and not flat.is_floating_point():
+            # Metal lacks unsigned-to-int64 reduction kernels. Widen one scan
+            # row at a time to retain all counts without expanding the cube.
+            sums = []
+            for row in flat:
+                row = row.to(torch.int64)
+                if indices is not None:
+                    row = row.index_select(-1, indices)
+                sums.append(row.sum(-1))
+            total = torch.stack(sums)
+        else:
+            if indices is not None:
+                flat = flat.index_select(-1, indices)
+            total = flat.sum(-1, dtype=accum_dtype)
+        image = total.float().detach().cpu().numpy()
     else:
-        array = dataset.get() if hasattr(dataset, "get") else np.asarray(dataset)
-        flat = array.reshape(*scan_shape, -1)
-        image = flat[..., mask.reshape(-1)].sum(
-            axis=-1,
-            dtype=np.float32,
-        )
+        # Both NumPy and CuPy implement these array operations. Transfer only
+        # the integrated scan image when the source lives on the GPU.
+        flat = dataset.reshape(*scan_shape, -1)
+        accum_dtype = None if np.issubdtype(flat.dtype, np.integer) else np.float32
+        if num_selected == mask.size:
+            image = flat.sum(axis=-1, dtype=accum_dtype)
+        else:
+            image = np.sum(flat, axis=-1, where=mask.ravel(), dtype=accum_dtype)
+        image = to_numpy(image, dtype=np.float32)
     return image / num_selected if reduce == "mean" else image
 
 
@@ -196,6 +209,24 @@ def _canvas_positions(self, index, corrected, strip_padding):
             dtype=positions.dtype,
         )
     return to_numpy(positions, dtype=np.float32)
+
+
+def _sampling_angstrom(reference) -> np.ndarray:
+    """Convert calibrated row and column spacings to ångströms."""
+    scales = {
+        "nm": 10.0, "angstrom": 1.0, "ångström": 1.0, "å": 1.0, "a": 1.0,
+        "pm": 0.01, "µm": 1e4, "μm": 1e4, "um": 1e4, "m": 1e10,
+    }
+    try:
+        sampling = np.array([
+            scales[str(unit).strip().lower()] * spacing
+            for unit, spacing in zip(reference.units[:2], reference.sampling[:2], strict=True)
+        ])
+    except (KeyError, TypeError) as exc:
+        raise ValueError("Set physical scan sampling and length units before exporting positions.") from exc
+    if not np.all(np.isfinite(sampling) & (sampling > 0)):
+        raise ValueError("Set finite positive physical scan sampling before exporting positions.")
+    return sampling
 
 
 def probe_positions(
@@ -261,15 +292,7 @@ def probe_positions(
         if not isinstance(factor, (int, np.integer)) or factor < 1 or any(n % factor for n in raw_shape):
             raise ValueError("Supply a positive integer upsample dividing both phase dimensions.")
         reference = self.imgs[0]
-        scales = {"nm": 10., "angstrom": 1., "ångström": 1., "å": 1., "a": 1.,
-                  "pm": 0.01, "µm": 1e4, "μm": 1e4, "um": 1e4, "m": 1e10}
-        try:
-            sampling_A = np.array([scales[str(u).strip().lower()] * v for u, v in
-                                   zip(reference.units[:2], reference.sampling[:2], strict=True)])
-        except KeyError as exc:
-            raise ValueError("Set physical scan sampling and length units before exporting positions.") from exc
-        if not np.all(np.isfinite(sampling_A) & (sampling_A > 0)):
-            raise ValueError("Set finite positive physical scan sampling before exporting positions.")
+        sampling_A = _sampling_angstrom(reference)
         canvas = _canvas_positions(self, index, corrected, False)
         if downsample == 1:
             sites = canvas[::factor, ::factor].astype(np.float64)
@@ -644,7 +667,17 @@ def corrected_4dstem_views(correction, *, det_bin: int = 1) -> list[np.ndarray]:
     """
     def detector_bin(data):
         if is_loaded_4dstem(data):
-            return data.read(detector_bin=det_bin)
+            if det_bin == 1:
+                return data.read()
+            # Decode one scan row at a time. Use the dense path below for the
+            # detector sum so fractional intensities retain their precision.
+            first = detector_bin(data.read(scan_region=(0, 1, 0, data.shape[1])))
+            binned = first.new_empty((data.shape[0], *first.shape[1:]))
+            binned[0] = first[0]
+            for row in range(1, data.shape[0]):
+                block = data.read(scan_region=(row, row + 1, 0, data.shape[1]))
+                binned[row] = detector_bin(block)[0]
+            return binned
         if det_bin == 1:
             return data
         detector_rows, detector_columns = data.shape[-2:]

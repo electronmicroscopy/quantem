@@ -29,9 +29,12 @@ def input_array(value):
     array = getattr(value, "array", None)
     if isinstance(array, np.ndarray):
         return array
+    tensor = getattr(value, "tensor", None)
+    if isinstance(tensor, torch.Tensor):
+        return tensor
     raise TypeError(
         f"DriftCorrection accepts ndarray, torch.Tensor, or Dataset "
-        f"objects or quantem.gpu FourDSTEMData; got {type(value).__name__}. To load from disk, call "
+        f"objects or quantem.gpu Dataset4dstem; got {type(value).__name__}. To load from disk, call "
         f"Dataset2d.from_file(path) (or Dataset4d.from_file) first."
     )
 
@@ -48,7 +51,7 @@ def prepare_image_collection(
         for image, source in zip(correction.imgs, source_datasets):
             for name in ("origin", "sampling", "units"):
                 value = getattr(source, name, None)
-                if value is not None:
+                if value is not None and all(axis is not None for axis in value[:2]):
                     setattr(image, name, value[:2])
             signal_units = getattr(source, "signal_units", None)
             if signal_units is not None:

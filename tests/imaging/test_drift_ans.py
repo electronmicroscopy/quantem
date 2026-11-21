@@ -16,7 +16,7 @@ def test_ans_alignment_and_correction_match_dense(tmp_path):
     backend = os.environ.get("QEM_TEST_BACKEND")
     if backend not in {"cuda", "mps"}:
         pytest.skip("Set QEM_TEST_BACKEND to cuda or mps on that accelerator.")
-    from quantem.gpu.io import FourDSTEMData, load
+    from quantem.gpu.io import Dataset4dstem, load
     from quantem.core.io import load as load_correction
 
     rng = np.random.default_rng(15)
@@ -25,23 +25,20 @@ def test_ans_alignment_and_correction_match_dense(tmp_path):
     for index, data in enumerate((values, np.rot90(values, -1).copy())):
         path = tmp_path / f"scan_{index}.npy"
         np.save(path, data)
-        sources.append(load(path, backend=backend, verbose=False))
+        sources.append(load(path, device=backend, verbose=False))
         sources[-1].metadata["entry/instrument/detector/count_time"] = 0.00005
     try:
-        original_read = FourDSTEMData.read
+        original_read = Dataset4dstem.read
         calls = []
 
-        def bounded_read(self, *, scan_region=None, detector_region=None,
-                         detector_bin=1):
-            assert (scan_region is not None or detector_region is not None
-                    or detector_bin > 1)
+        def bounded_read(self, *, scan_region=None, detector_region=None):
+            assert scan_region is not None or detector_region is not None
             calls.append((scan_region, detector_region))
             return original_read(self, scan_region=scan_region,
-                                 detector_region=detector_region,
-                                 detector_bin=detector_bin)
+                                 detector_region=detector_region)
 
         with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(FourDSTEMData, "read", bounded_read)
+            patch.setattr(Dataset4dstem, "read", bounded_read)
             encoded = DriftCorrection.from_4dstem(*sources, device=backend)
             dense = DriftCorrection.from_4dstem(
                 torch.from_numpy(values).to(backend),

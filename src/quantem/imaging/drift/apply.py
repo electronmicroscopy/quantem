@@ -23,11 +23,14 @@ from quantem.imaging.drift.core.warping import (
 
 def is_loaded_4dstem(value) -> bool:
     """Recognize the public loader result without requiring quantem.gpu."""
+    if not callable(getattr(value, "read", None)):
+        return False
     try:
-        from quantem.gpu.io import FourDSTEMData
+        from quantem.gpu import io
     except ImportError:
         return False
-    return isinstance(value, FourDSTEMData)
+    loader_type = getattr(io, "Dataset4dstem", getattr(io, "FourDSTEMData", ()))
+    return isinstance(value, loader_type)
 
 
 def dataset_info(dataset) -> dict[str, object]:
@@ -380,7 +383,6 @@ def apply_correction_to_dataset(
     is_loaded = is_loaded_4dstem(ds_4d)
     is_numpy = isinstance(ds_4d, np.ndarray)
     original_shape = ds_4d.shape if is_numpy else tuple(ds_4d.shape)
-    input_np_dtype = ds_4d.dtype if is_numpy else None
     use_external_output = output is not None
 
     if use_external_output:
@@ -436,15 +438,6 @@ def apply_correction_to_dataset(
     col_coords = torch.arange(scan_w, device=device, dtype=torch.float32)
     sample_row = row_coords[:, None].expand(scan_h, scan_w) - drift_row
     sample_col = col_coords[None, :].expand(scan_h, scan_w) - drift_col
-    if is_loaded:
-        from quantem.gpu.geometry import resample_scan
-
-        return resample_scan(
-            ds_4d, torch.stack((sample_row, sample_col), dim=-1),
-            mode=mode, output_dtype=output_dtype, output_device=output_device,
-            output=output, verbose=verbose,
-        )
-
     # ── Pre-compute warp grid ONCE (tiny: 1×H×W×2 f32) ──
     warp_grid = torch.stack([
         2.0 * sample_col / (scan_w - 1) - 1.0,
@@ -452,23 +445,18 @@ def apply_correction_to_dataset(
     ], dim=-1)[None]                                       # (1, H, W, 2)
 
     # ── Flatten input to (H, W, C) view ──
-    flat = (
-        torch.from_numpy(ds_4d.reshape(scan_h, scan_w, n_channels))
-        if is_numpy
-        else ds_4d.reshape(scan_h, scan_w, n_channels)
-    )
+    if not is_loaded:
+        tensor = torch.from_numpy(ds_4d) if is_numpy else ds_4d
+        flat = tensor.reshape(scan_h, scan_w, n_channels)
 
     # Output dtype for device intermediates.
     out_dt = torch.float32
     if output_dtype == "same":
-        if is_numpy and input_np_dtype is not None:
-            out_dt = torch.from_numpy(
-                np.empty(0, dtype=input_np_dtype)
-            ).dtype
-        elif not is_numpy:
-            out_dt = ds_4d.dtype
-    elif isinstance(output_dtype, torch.dtype):
-        out_dt = output_dtype
+        out_dt = (torch.from_numpy(np.empty((), dtype=ds_4d.dtype)).dtype
+                  if is_numpy or is_loaded else ds_4d.dtype)
+    elif output_dtype is not None:
+        out_dt = (output_dtype if isinstance(output_dtype, torch.dtype) else
+                  torch.from_numpy(np.empty((), dtype=output_dtype)).dtype)
 
     # ── Target device ──
     # Default the output to the input's device so the pipeline stays
@@ -479,6 +467,8 @@ def apply_correction_to_dataset(
         target = torch.device(output_device)
         if target.type == "cuda":
             target = device
+    elif is_loaded:
+        target = torch.device(ds_4d.device)
     elif (
         isinstance(ds_4d, torch.Tensor)
         and (ds_4d.is_cuda or ds_4d.device.type == "mps")
@@ -517,6 +507,13 @@ def apply_correction_to_dataset(
         else:
             chunk_size = min(n_channels, 64)
 
+    if is_loaded:
+        # Align reads to rectangular detector tiles. A tile spans complete
+        # rows or part of one row, with at most the requested channel count.
+        width = original_shape[-1]
+        if chunk_size >= width:
+            chunk_size = (chunk_size // width) * width
+
     # ── Allocate output ──
     if use_external_output:
         out_flat = output.reshape(scan_h, scan_w, n_channels)
@@ -530,18 +527,29 @@ def apply_correction_to_dataset(
         _out_np_dtype = output.dtype
 
     # ── Vectorized grid_sample with pre-computed grid ──
-    chunks = range(0, n_channels, chunk_size)
-    num_chunks = len(chunks)
+    if is_loaded and chunk_size < width:
+        chunks = ((row + col, row + min(col + chunk_size, width))
+                  for row in range(0, n_channels, width)
+                  for col in range(0, width, chunk_size))
+    else:
+        chunks = ((start, min(start + chunk_size, n_channels))
+                  for start in range(0, n_channels, chunk_size))
     correction_progress = tqdm(
         total=n_channels,
         desc=progress_desc,
         unit="channel",
-        disable=not verbose or num_chunks <= 1,
+        disable=not verbose or n_channels <= chunk_size,
     )
-    for start in chunks:
-        end = min(start + chunk_size, n_channels)
+    for start, end in chunks:
+        if is_loaded:
+            r0, c0 = divmod(start, width)
+            r1, c1 = divmod(end - 1, width)
+            block = ds_4d.read(detector_region=(r0, r1 + 1, c0, c1 + 1))
+            channels = block.reshape(scan_h, scan_w, end - start)
+        else:
+            channels = flat[:, :, start:end]
         warped = F.grid_sample(
-            flat[:, :, start:end].permute(2, 0, 1).contiguous()
+            channels.permute(2, 0, 1).contiguous()
             .to(device=device, dtype=torch.float32)[None],
             warp_grid,
             mode=mode, align_corners=True, padding_mode="border",
