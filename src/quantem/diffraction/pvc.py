@@ -828,7 +828,8 @@ def pair_vector_marks(
 
 class OrderParameter(NamedTuple):
     """Result of order_parameter: Omega, its standard error and confidence
-    interval, and the bias-corrected correlation (profile) in each r_eff bin."""
+    interval (by default the 10th to 90th percentile), and the bias-corrected
+    correlation (profile) in each r_eff bin."""
 
     value: float
     standard_error: float
@@ -843,17 +844,21 @@ def order_parameter(
     r,
     theta_deg,
     r_range: tuple[float, float] = (2.0, 10.0),
-    r_bin: float = 0.5,
+    r_bin: float = 1.0,
     min_structure: float = 0.2,
-    confidence: float = 0.95,
+    confidence: float = 0.8,
 ) -> OrderParameter:
     """
     Order parameter Omega of a sample relative to a reference structure, usually
     the perfect crystal of the same material, with a confidence interval.
 
-    In each bin of r_eff = max(r, r'), Omega compares the shape of the sample's
-    pair vector correlation with the reference's: the correlation coefficient of
-    the two maps over (r, r', theta). Theta is a density per unit solid angle,
+    Each point (r, r', theta) of a map correlates two pair vectors, and r_eff =
+    max(r, r') is the length of the longer one: the distance over which the
+    point tests the order. The points are grouped into bins of r_eff, and in
+    each bin Omega compares the shape of the sample's pair vector correlation
+    with the reference's: the correlation coefficient of the two maps over
+    (r, r', theta). r_eff is a label for each point, not a cutoff; only r_range
+    limits it, and its upper end must fit inside the illuminated volume. Theta is a density per unit solid angle,
     so each angle is weighted by its solid angle, sin(theta); on a uniform grid
     in theta, the few pair vectors near 0 and 180 deg would otherwise count as
     much as the many near 90 deg. Maps of the beam model, with dphi from 0 to
@@ -864,9 +869,12 @@ def order_parameter(
     The correlation coefficient ignores amplitude, so a bin in which the
     reference is nearly flat would count as much as any other, while its value
     is set by small residuals. Bins whose reference RMS is below min_structure
-    times the median over the bins are left out. Crystalline Si, for example,
-    has no pair vectors between 2.35 and 3.84 A, and its bin from 3.0 to 3.5 A
-    holds only the tails of the neighboring shells, below 0.1 of the median.
+    times the median over the bins are left out. Bins narrower than the spacing
+    of the neighbor shells alternate between bins that hold a shell and bins
+    between shells, which makes the profile oscillate; crystalline Si, for
+    example, has no pair vectors between 2.35 and 3.84 A, and a bin from 3.0 to
+    3.5 A holds only the tails of the neighboring shells. With the default 1 A
+    bins, every bin of Si holds at least one shell.
 
     Noise adds power to the sample's map but does not correlate with the
     reference, so the correlation of a single map is biased toward 0. The
@@ -876,7 +884,8 @@ def order_parameter(
     correlation is estimated from the products of different groups, whose noise
     is independent, which removes the bias. Leaving out one group at a time
     (jackknife) gives the standard error, and the interval uses Student's t with
-    K - 1 degrees of freedom, clipped to [-1, 1]. A wide interval means that the
+    K - 1 degrees of freedom, clipped to [-1, 1]. The default confidence of 0.8
+    gives the 10th to 90th percentile. A wide interval means that the
     groups disagree: the data cannot measure Omega at that dose and number of
     patterns.
 
@@ -888,7 +897,7 @@ def order_parameter(
     r, theta_deg : grids of the maps, the r and theta_deg of correlation().
     r_range, r_bin : bins of r_eff (A).
     min_structure : smallest reference RMS of a bin, relative to the median bin.
-    confidence : of the interval.
+    confidence : of the interval, 0.8 for the 10th to 90th percentile.
 
     Example, with 16 blocks of a 256 x 256 scan ds:
 

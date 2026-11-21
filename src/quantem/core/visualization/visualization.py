@@ -681,8 +681,10 @@ def show_1d(
     ylabel: str | Sequence[str] | None = None,
     log_y: bool | Sequence[bool] = False,
     xlim: tuple[float, float] | None = None,
+    ylim: tuple[float, float] | None = None,
     xticks: ArrayLike | None = None,
     colors: Sequence[str] | None = None,
+    bands: Sequence[Any] | None = None,
     figax: tuple[Any, Any] | None = None,
     axsize: tuple[float, float] = (5, 3),
     save: os.PathLike | str | None = None,
@@ -709,12 +711,16 @@ def show_1d(
         Axis labels.
     log_y : bool or sequence of bool, default=False
         Whether to use a logarithmic vertical axis.
-    xlim : tuple, optional
-        Horizontal axis limits, shared by all panels.
+    xlim, ylim : tuple, optional
+        Axis limits, shared by all panels.
     xticks : array-like, optional
         Horizontal tick positions, shared by all panels.
     colors : sequence of str, optional
         Line colors, cycled over the curves of each panel. Defaults to ``viz.colors.set``.
+    bands : sequence, optional
+        Shaded intervals, such as confidence intervals, in the color of each curve. One
+        ``(lower, upper)`` pair of arrays per curve, nested like ``arrays``; ``None`` leaves a
+        curve without a band.
     figax : tuple, optional
         (fig, axs) tuple to plot on. If None, a new figure and axes are created.
     axsize : tuple, default=(5, 3)
@@ -788,6 +794,14 @@ def show_1d(
             [lab] if isinstance(lab, str) else list(lab) for lab in per_panel(labels, "labels")
         ]
 
+    if bands is None:
+        panel_bands = [[None] * len(panel) for panel in panels]
+    else:
+        panel_bands = [list(b) for b in (per_panel(bands, "bands") if num_panels > 1 else [bands])]
+        for panel, b in zip(panels, panel_bands):
+            if len(b) != len(panel):
+                raise ValueError(f"bands has {len(b)} entries for {len(panel)} curves")
+
     titles = per_panel(title, "title")
     xlabels = per_panel(xlabel, "xlabel")
     ylabels = per_panel(ylabel, "ylabel")
@@ -806,19 +820,25 @@ def show_1d(
         )
         axs = axs.ravel()
 
-    for ax, panel, xv, labs, ttl, xl, yl, logy in zip(
-        axs, panels, xs, panel_labels, titles, xlabels, ylabels, log_ys
+    for ax, panel, xv, labs, ttl, xl, yl, logy, pb in zip(
+        axs, panels, xs, panel_labels, titles, xlabels, ylabels, log_ys, panel_bands
     ):
         for k, y in enumerate(panel):
             coords = np.arange(len(y)) if xv is None else xv
             if len(coords) != len(y):
                 raise ValueError(f"x has length {len(coords)} but the curve has length {len(y)}")
             label = labs[k] if k < len(labs) else None
-            ax.plot(coords, y, color=colors[k % len(colors)], label=label, **kwargs)
+            color = colors[k % len(colors)]
+            if pb[k] is not None:
+                lower, upper = (np.asarray(as_numpy(v)).ravel() for v in pb[k])
+                ax.fill_between(coords, lower, upper, color=color, alpha=0.25, linewidth=0)
+            ax.plot(coords, y, color=color, label=label, **kwargs)
         if logy:
             ax.set_yscale("log")
         if xlim is not None:
             ax.set_xlim(xlim)
+        if ylim is not None:
+            ax.set_ylim(ylim)
         if xticks is not None:
             ax.set_xticks(xticks)
         if ttl is not None:

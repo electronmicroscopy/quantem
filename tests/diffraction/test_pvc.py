@@ -188,7 +188,7 @@ def test_order_parameter_removes_noise_bias():
     reference[(r_eff >= 3.0) & (r_eff < 3.5)] *= 0.01
     signal = 0.6 * reference + 0.8 * rng.normal(size=reference.shape)
     groups = signal + 3.0 * rng.normal(size=(8, *reference.shape))
-    omega = order_parameter(groups, reference, r, theta, r_range=(2.0, 4.0))
+    omega = order_parameter(groups, reference, r, theta, r_range=(2.0, 4.0), r_bin=0.5)
     assert np.allclose(omega.r_eff, [2.25, 2.75, 3.75]), omega.r_eff
 
     def corr(x, c):
