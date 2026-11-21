@@ -690,6 +690,69 @@ except ValueError:
     pass
 
 
+def color_wheel(
+    n: int = 256,
+    saturation: float = 1.0,
+    repeat: int = 1,
+    colorslist: list | None = None,
+    gamma: float = 1.0,
+) -> np.ndarray:
+    """Color wheel legend: angle sets the hue and radius sets the brightness.
+
+    Used to label images colored by direction, such as composite dark field
+    images or differential phase contrast.
+
+    Parameters
+    ----------
+    n : int, default=256
+        Size of the output image in pixels.
+    saturation : float, default=1.0
+        Saturation of the hues, from 0 (gray) to 1 (full color).
+    repeat : int, default=1
+        Number of times the hues (or `colorslist`) go round the wheel.
+    colorslist : list, optional
+        Colors placed evenly around the wheel, as matplotlib color names, hex
+        strings or RGB tuples (0-1 or 0-255). The last color is joined back to
+        the first, so the wheel has no seam; a list that already ends with its
+        first color is used as is. None uses the HSV hues.
+    gamma : float, default=1.0
+        Brightness at radius r (0 at the center, 1 at the edge) is r**gamma.
+        Use the gamma of the image the wheel labels, such as the gamma of
+        composite_ddf, so the legend matches it.
+
+    Returns
+    -------
+    np.ndarray
+        (n, n, 4) RGBA image in [0, 1], transparent outside the wheel.
+    """
+    y, x = np.mgrid[-1 : 1 : n * 1j, -1 : 1 : n * 1j]
+    r = np.hypot(x, y)
+    hue = (np.arctan2(y, x) * repeat / (2 * np.pi)) % 1.0
+    value = np.clip(r, 0, 1) ** gamma
+    alpha = (r <= 1.0).astype(float)[..., None]
+
+    if colorslist is None:
+        hsv = np.stack([hue, np.full_like(hue, saturation), value], axis=-1)
+        rgb = colors.hsv_to_rgb(hsv)
+    else:
+        cols = []
+        for c in colorslist:
+            if isinstance(c, str):
+                cols.append(colors.to_rgb(c))
+            else:
+                c = np.asarray(c, dtype=float)[:3]
+                cols.append(tuple(c / 255.0 if c.max() > 1 else c))
+        if not np.allclose(cols[0], cols[-1]):
+            cols.append(cols[0])
+        cmap = colors.LinearSegmentedColormap.from_list("wheel", cols, N=256)
+        rgb = cmap(hue)[..., :3]
+        gray = rgb.mean(axis=-1, keepdims=True)
+        rgb = gray + saturation * (rgb - gray)
+        rgb = rgb * value[..., None]
+
+    return np.concatenate([rgb, alpha], axis=-1)
+
+
 def bilinear_histogram_2d(
     shape: tuple[int, int],
     x: NDArray,

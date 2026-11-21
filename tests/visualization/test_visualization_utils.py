@@ -15,6 +15,7 @@ from quantem.core.visualization.visualization_utils import (
     add_scalebar_to_ax,
     array_to_rgba,
     bilinear_histogram_2d,
+    color_wheel,
     combine_arrays_to_rgba,
     estimate_scalebar_length,
     turbo_black,
@@ -143,6 +144,19 @@ class TestTurboBlack:
             assert np.allclose(colors[0, :3], 0.0), (num_colors, fade_len)  # starts at black
             assert np.allclose(colors[fade:], turbo[fade:]), (num_colors, fade_len)
             assert np.allclose(colors[fade - 1], turbo[fade - 1]), (num_colors, fade_len)
+
+
+class TestColorWheel:
+    def test_color_list_wheel_has_no_seam(self):
+        wheel = color_wheel(65, repeat=1, colorslist=["red", "lime", (0, 0, 255)])
+        # just above and below the +x axis, where the list wraps from last to first
+        np.testing.assert_allclose(wheel[31, 63, :3], wheel[33, 63, :3], atol=0.1)
+        np.testing.assert_allclose(wheel[32, 64], [1, 0, 0, 1])
+        assert wheel[0, 0, 3] == 0, "corner should be outside the wheel"
+        # pixel (32, 48) is at radius 0.5 on the red axis
+        for gamma in (1.0, 0.5):
+            wheel = color_wheel(65, colorslist=["red", "lime", "blue"], gamma=gamma)
+            np.testing.assert_allclose(wheel[32, 48, 0], 0.5**gamma, err_msg=f"gamma={gamma}")
 
 
 class TestBilinearHistogram2D:
