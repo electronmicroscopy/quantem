@@ -1,3 +1,6 @@
+import os
+import sys
+import warnings
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -136,10 +139,14 @@ class ScalebarConfig:
         Converts between pm, Å, nm, μm, mm, cm and m, or between their
         reciprocals (e.g. "1/nm" to "1/Å"). If None, units are chosen
         automatically from the bar length.
-    width_px : float, default=1
-        Width of the scale bar in pixels.
-    pad_px : float, default=0.5
-        Padding around the scale bar in pixels.
+    width_px : float, optional
+        Thickness of the scale bar in image pixels; fractions are kept. If
+        None, the plot chooses: 1 pixel for an image, or a fraction of the
+        map size for orientation and phase maps.
+    pad_px : float, optional
+        Gap between the scale bar (or its box) and the edge of the plot, in
+        image pixels. If None, matplotlib's default spacing is used, which
+        scales with the label font size rather than the image.
     color : str, default="white"
         Color of the scale bar.
     loc : str or int, default="lower right"
@@ -167,8 +174,8 @@ class ScalebarConfig:
     units: str = "pixels"
     length: float | None = None
     display_units: str | None = None
-    width_px: float = 1
-    pad_px: float = 0.5
+    width_px: float | None = None
+    pad_px: float | None = None
     color: str = "white"
     loc: str | int = "lower right"
     fontsize: int = 12
@@ -256,6 +263,64 @@ def _fill_scalebar_calibration(cfg: Any, sampling: float, units: str) -> Any:
     return resolved
 
 
+_QUANTEM_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _warn_from_caller(message: str) -> None:
+    """Issue a UserWarning attributed to the first frame outside quantem.
+
+    Python shows a warning once per source line, so a warning raised inside
+    quantem would appear only the first time. Attributing it to the caller's
+    line shows it for every call site in a script or notebook.
+    """
+    if sys.version_info >= (3, 12):
+        warnings.warn(message, UserWarning, skip_file_prefixes=(_QUANTEM_ROOT + os.sep,))
+    else:
+        # stacklevel counts from this function; step past every quantem frame
+        level, frame = 2, sys._getframe(1)
+        while frame is not None and frame.f_code.co_filename.startswith(_QUANTEM_ROOT + os.sep):
+            frame, level = frame.f_back, level + 1
+        warnings.warn(message, UserWarning, stacklevel=level)
+
+
+def _is_pixel_units(units: Any) -> bool:
+    """True for the uncalibrated scale bar units ("pixels", "pixel", "px")."""
+    return isinstance(units, str) and units.strip().lower() in ("pixels", "pixel", "px")
+
+
+def _scalebar_lacks_calibration(cfg: Any) -> bool:
+    """Whether a requested scale bar carries no sampling and units of its own.
+
+    Parameters
+    ----------
+    cfg : None, bool, dict, ScalebarConfig or ShowParams.Scalebar
+        The scale bar as passed by the user.
+
+    Returns
+    -------
+    bool
+        False when no bar is requested. For a dict, True unless it gives both
+        "sampling" and "units". For anything else, True when its units are
+        still pixels.
+    """
+    if cfg is None or cfg is False:
+        return False
+    if isinstance(cfg, dict):
+        return not ("sampling" in cfg and "units" in cfg)
+    resolved = _resolve_scalebar(cfg)
+    return resolved is not None and _is_pixel_units(resolved.units)
+
+
+def _scalebar_display_units(cfg: Any) -> str | None:
+    """The display_units a scale bar asks for, or None."""
+    if cfg is None or cfg is False or cfg is True:
+        return None
+    if isinstance(cfg, dict):
+        return cfg.get("display_units")
+    resolved = _resolve_scalebar(cfg)
+    return None if resolved is None else resolved.display_units
+
+
 def estimate_scalebar_length(length: float, sampling: float) -> tuple[float, float]:
     """Estimate an appropriate scale bar length based on data dimensions.
 
@@ -310,9 +375,7 @@ _LENGTH_UNITS_IN_ANGSTROM = {
 # Accepted spellings (compared in lower case) for each unit above.
 _LENGTH_UNIT_ALIASES = {
     **dict.fromkeys(["pm", "picometer", "picometre", "picometers", "picometres"], "pm"),
-    **dict.fromkeys(
-        ["a", "å", "Å", "ang", "angstrom", "angstroms", "ångström", "ångströms"], "Å"
-    ),
+    **dict.fromkeys(["a", "å", "Å", "ang", "angstrom", "angstroms", "ångström", "ångströms"], "Å"),
     **dict.fromkeys(["nm", "nanometer", "nanometre", "nanometers", "nanometres"], "nm"),
     **dict.fromkeys(
         [
@@ -393,8 +456,7 @@ def _length_unit_factor(from_units: str, to_units: str) -> float:
     if src[1] != dst[1]:
         kinds = {1: "a real-space length", -1: "a reciprocal length"}
         raise ValueError(
-            f"Cannot convert {from_units!r} ({kinds[src[1]]}) to {to_units!r} "
-            f"({kinds[dst[1]]})."
+            f"Cannot convert {from_units!r} ({kinds[src[1]]}) to {to_units!r} ({kinds[dst[1]]})."
         )
     ratio = _LENGTH_UNITS_IN_ANGSTROM[src[0]] / _LENGTH_UNITS_IN_ANGSTROM[dst[0]]
     return ratio if src[1] == 1 else 1 / ratio
@@ -434,14 +496,38 @@ def _normalize_length_units(length_units: float, units: str) -> tuple[float, str
         return length_A / 1e10, "m"
 
 
+class _PixelPaddedSizeBar(AnchoredSizeBar):
+    """AnchoredSizeBar held `pad_px` image pixels from the edge of the axes.
+
+    matplotlib measures `borderpad` in multiples of the label font size, so
+    a gap in image pixels has to be converted with the current data-to-screen
+    scale. That is redone every time the bar is placed, so the gap follows
+    any later change of figure size or layout (e.g. ``tight_layout``).
+    """
+
+    def __init__(self, transform, *args, pad_px: float, **kwargs):
+        super().__init__(transform, *args, borderpad=0.0, **kwargs)
+        self._pad_px = float(pad_px)
+        self._pad_transform = transform
+
+    def get_offset(self, *args, **kwargs):
+        renderer = kwargs.get("renderer", args[-1] if args else None)
+        if renderer is not None:
+            (x0, y0), (x1, y1) = self._pad_transform.transform([(0, 0), (1, 1)])
+            screen_px_per_image_px = 0.5 * (abs(x1 - x0) + abs(y1 - y0))
+            fontsize = renderer.points_to_pixels(self.prop.get_size_in_points())
+            self.borderpad = self._pad_px * screen_px_per_image_px / fontsize
+        return super().get_offset(*args, **kwargs)
+
+
 def add_scalebar_to_ax(
     ax: Axes,
     array_size: float,
     sampling: float,
     length_units: float | None,
     units: str,
-    width_px: float,
-    pad_px: float,
+    width_px: float | None,
+    pad_px: float | None,
     color: str,
     loc: str | int,
     fontsize: int = 12,
@@ -468,10 +554,11 @@ def add_scalebar_to_ax(
         will be estimated.
     units : str
         Units to display on the scale bar.
-    width_px : float
-        Width of the scale bar in pixels.
-    pad_px : float
-        Padding around the scale bar in pixels.
+    width_px : float or None
+        Thickness of the scale bar in image pixels. None means 1 pixel.
+    pad_px : float or None
+        Gap between the scale bar (or its box) and the edge of the plot, in
+        image pixels. None uses matplotlib's default spacing.
     color : str
         Color of the scale bar.
     loc : str or int
@@ -501,6 +588,14 @@ def add_scalebar_to_ax(
     """
     from matplotlib.font_manager import FontProperties
 
+    if display_units is not None and _parse_length_units(units) is None:
+        _warn_from_caller(
+            f"display_units={display_units!r} ignored: the scale bar is in {units!r}, "
+            "which is not a calibrated length, so it is drawn without conversion. Pass a "
+            "calibrated dataset rather than its array, or give 'sampling' and 'units' in "
+            "the scale bar."
+        )
+        display_units = None
     if display_units is not None:
         if isinstance(sampling, (tuple, list)):
             sampling = np.asarray(sampling, dtype=float)
@@ -530,25 +625,31 @@ def add_scalebar_to_ax(
     fontprops = FontProperties(size=fontsize, weight="bold" if bold else "normal")
 
     label_top = loc[:3] == "low"
-    bar = AnchoredSizeBar(
-        ax.transData,
-        length_px,
-        label,
-        loc,
-        pad=pad_px,
+    bar_kwargs = dict(
         color=color,
         frameon=box,
         label_top=label_top,
-        size_vertical=int(width_px),
+        size_vertical=1.0 if width_px is None else float(width_px),
         fontproperties=fontprops,
         sep=2 if label_top else int(round(0.3 * fontsize)),
     )
+    if pad_px is None:
+        # matplotlib's own spacing, in multiples of the label font size
+        bar = AnchoredSizeBar(ax.transData, length_px, label, loc, pad=0.5, **bar_kwargs)
+    else:
+        bar = _PixelPaddedSizeBar(
+            ax.transData,
+            length_px,
+            label,
+            loc,
+            pad=0.3 if box else 0.0,
+            pad_px=pad_px,
+            **bar_kwargs,
+        )
     if box:
         bar.patch.set(facecolor=box_color, edgecolor="none", alpha=box_alpha)
     if outline_color is not None:
-        effects = [
-            patheffects.withStroke(linewidth=outline_width, foreground=outline_color)
-        ]
+        effects = [patheffects.withStroke(linewidth=outline_width, foreground=outline_color)]
         for artist in bar.size_bar.get_children():
             artist.set_path_effects(effects)
         for artist in bar.txt_label.get_children():

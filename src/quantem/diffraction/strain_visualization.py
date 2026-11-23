@@ -273,7 +273,7 @@ def plot_strain_panels(
             "units": ds_units,
             "length": None,
             "width_px": 1,
-            "pad_px": 0.5,
+            "pad_px": None,
             "color": "white" if box and box_color == "black" else "black",
             "loc": "lower left",
             "fontsize": 12,
