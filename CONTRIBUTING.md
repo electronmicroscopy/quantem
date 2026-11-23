@@ -2,6 +2,8 @@
 
 Thanks for your interest in improving quantem! Bug reports, feature requests, and pull requests are all welcome.
 
+Everyone taking part in quantem is expected to follow our [Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## Contribution workflow
 
 - Open an [issue](https://github.com/electronmicroscopy/quantem/issues) to report a bug or discuss a feature before starting larger work.
