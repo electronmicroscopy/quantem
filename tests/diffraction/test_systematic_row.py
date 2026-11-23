@@ -36,7 +36,10 @@ def test_row_indexing():
     assert rm.ring_label[rm.ring[0, 0, 0]] == "(200)"
     angle, _ = rm.in_plane_angle("LiF")
     assert np.isclose(angle[0, 0], 30.0) and np.isclose(angle[0, 1], 10.0), angle
-    assert rm.num_directions()[0, 1] == 2
+    i200 = [family for _, family, _ in rm.rings("LiF")].index("(200)")
+    angle, _ = rm.in_plane_angle("LiF", i200)
+    assert np.isclose(angle[0, 0], 30.0), "an integer ring indexes the rings of that phase"
+    assert rm.num_directions().tolist() == [[1, 2], [0, 0]], "only indexed rows count"
     assert rm.intensity[1, 0, 0] == 0, "an unpaired peak must not form a row"
     assert rm.phase[1, 1, 0] == -1 and rm.intensity[1, 1, 0] > 0, "off-ring row kept unassigned"
     single = SystematicRowMap.from_vectors(peaks, [lif, li], k_min=0.2, k_max=0.6)

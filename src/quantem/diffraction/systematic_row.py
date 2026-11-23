@@ -46,6 +46,8 @@ class SystematicRowMap(AutoSerialize):
         origin at zero.
     crystals : list of Crystal
         Candidate phases with structure factors calculated.
+    k_min, k_max, min_ring_intensity
+        See :meth:`from_vectors`.
     """
 
     _token = object()
@@ -159,8 +161,10 @@ class SystematicRowMap(AutoSerialize):
 
         Each peak is paired with the brightest unpaired peak within
         `pair_tol` of its inversion through the origin, and the pair becomes
-        one row with ``g = (q_1 - q_2) / 2`` and the summed intensity. The row
-        is assigned to the nearest candidate ring within `k_tol` of ``|g|``; a
+        one row with ``g = (q_1 - q_2) / 2`` and the summed intensity. A row
+        here is one Friedel pair, not a whole systematic row: higher orders of
+        the same row, such as +2g and -2g, give separate rows with the same
+        in-plane angle and their own ring. The row is assigned to the nearest candidate ring within `k_tol` of ``|g|``; a
         row with a second ring inside `k_tol` is marked ambiguous, and a row
         with no ring inside `k_tol` keeps phase -1. Rows are sorted by
         intensity and the strongest `num_rows` are kept.
@@ -254,14 +258,23 @@ class SystematicRowMap(AutoSerialize):
         return [i for i in range(len(self.ring_k)) if self.ring_phase[i] == p]
 
     def _ring_index(self, phase, ring) -> int:
-        """Ring table index from a family label such as "(200)" or an index."""
+        """Ring table index of a family of one phase.
+
+        `ring` is a family label such as "200" or "(200)", or an index into
+        the rings of that phase in the order of :meth:`rings` (increasing
+        radius).
+        """
+        indices = self._ring_indices(phase)
+        name = self.names[self._phase_index(phase)]
         if isinstance(ring, str):
             label = ring if ring.startswith("(") else f"({ring})"
-            for i in self._ring_indices(phase):
+            for i in indices:
                 if self.ring_label[i] == label:
                     return i
-            raise ValueError(f"No ring {ring} for {self.names[self._phase_index(phase)]}.")
-        return int(ring)
+            raise ValueError(f"No ring {ring} for {name}.")
+        if not -len(indices) <= int(ring) < len(indices):
+            raise ValueError(f"{name} has {len(indices)} rings, got index {ring}.")
+        return indices[int(ring)]
 
     def _panels(self, phase, ring) -> list[tuple[int, int | None, str]]:
         """(phase index, ring index or None, title) of every panel of a plot."""
@@ -279,7 +292,7 @@ class SystematicRowMap(AutoSerialize):
                 continue
             if isinstance(ring, str) and ring in ("strongest", "all"):
                 sig = {
-                    g: float((self.intensity * self._row_mask(p, g)).sum())
+                    g: float((self.intensity * self._row_mask(p, ring_idx=g)).sum())
                     for g in self._ring_indices(p)
                 }
                 found = [g for g in sig if sig[g] > 0]
@@ -292,15 +305,17 @@ class SystematicRowMap(AutoSerialize):
             panels += [(p, g, f"{name} {self.ring_label[g]}") for g in rings]
         return panels
 
-    def _row_mask(self, phase=None, ring=None, include_ambiguous: bool = False) -> NDArray:
-        """Rows of a phase (and ring), as a (R, C, M) boolean mask."""
+    def _row_mask(
+        self, phase=None, ring_idx: int | None = None, include_ambiguous: bool = False
+    ) -> NDArray:
+        """Indexed rows of a phase (and ring table index), as a (R, C, M) boolean mask."""
         self._require_index()
         if phase is None:
             m = self.phase >= 0
         else:
             m = self.phase == self._phase_index(phase)
-        if ring is not None:
-            m &= self.ring == self._ring_index(phase, ring)
+        if ring_idx is not None:
+            m &= self.ring == ring_idx
         if not include_ambiguous:
             m &= ~self.ambiguous
         return m
@@ -341,7 +356,8 @@ class SystematicRowMap(AutoSerialize):
         phase : str or int
             Crystal name or index.
         ring : str or int, optional
-            Restrict to one reflection family, e.g. "200". None (default)
+            Restrict to one reflection family, as a label such as "200" or an
+            index into the rings of the phase (:meth:`rings`). None (default)
             takes the strongest row of any family.
 
         Returns
@@ -352,7 +368,11 @@ class SystematicRowMap(AutoSerialize):
         intensity : np.ndarray
             ``(scan_row, scan_col)`` intensity of that row, 0 where none.
         """
-        m = self._row_mask(phase, ring)
+        return self._strongest_row(phase, None if ring is None else self._ring_index(phase, ring))
+
+    def _strongest_row(self, phase, ring_idx: int | None) -> tuple[NDArray, NDArray]:
+        """Angle and intensity of the strongest row of a phase and ring table index."""
+        m = self._row_mask(phase, ring_idx)
         w = np.where(m, self.intensity, -np.inf)
         j = np.argmax(w, axis=-1)
         has = np.isfinite(np.take_along_axis(w, j[..., None], axis=-1)[..., 0])
@@ -363,15 +383,16 @@ class SystematicRowMap(AutoSerialize):
     def num_directions(self, min_angle_deg: float = 15.0) -> NDArray:
         """``(scan_row, scan_col)`` number of distinct row directions at each position.
 
-        Rows within `min_angle_deg` of a stronger row count as the same
-        direction. Positions with two or more directions carry enough
-        information to determine a full orientation.
+        Only indexed rows count, without the ambiguous ones. Rows within
+        `min_angle_deg` of a stronger row count as the same direction.
+        Positions with two or more directions can carry enough information to
+        determine a full orientation, when the rows come from one crystal.
         """
-        self._require_index()
+        indexed = self._row_mask()
         out = np.zeros(self.shape, dtype=int)
-        for r, c in zip(*np.nonzero(self.intensity[..., 0] > 0)):
+        for r, c in zip(*np.nonzero(indexed.any(axis=-1))):
             dirs: list[float] = []
-            for a in self.angle_deg[r, c][self.intensity[r, c] > 0]:
+            for a in self.angle_deg[r, c][indexed[r, c]]:
                 if all(_angle_diff(a, b) > min_angle_deg for b in dirs):
                     dirs.append(a)
             out[r, c] = len(dirs)
@@ -495,9 +516,9 @@ class SystematicRowMap(AutoSerialize):
         ring : str, int or None, default="strongest"
             Reflection family of each map. "strongest" takes the family with
             the largest summed row intensity of each phase, "all" draws one
-            map per family with indexed rows, a label such as "200" or a ring
-            index selects that family, and None takes the strongest row of
-            any family.
+            map per family with indexed rows, a label such as "200" or an
+            index into the rings of the phase (:meth:`rings`) selects that
+            family, and None takes the strongest row of any family.
         angle_range : tuple, optional
             ``(low, high)`` angles in degrees mapped to the ends of the
             "turbo" colormap. Angles are wrapped modulo 180 into the half
@@ -524,7 +545,7 @@ class SystematicRowMap(AutoSerialize):
             1, len(panels), figsize=(axsize[0] * len(panels), axsize[1]), squeeze=False
         )
         for ax, (p, g, title) in zip(axs[0], panels):
-            angle, inten = self.in_plane_angle(p, g)
+            angle, inten = self._strongest_row(p, g)
             rgb = _angle_rgb(angle, angle_range, self._shade(inten, shade_range, shade_gamma))
             self._finish_map(ax, rgb, title, scalebar)
         if legend:
@@ -591,7 +612,7 @@ class SystematicRowMap(AutoSerialize):
         edges = np.arange(lo, hi + 0.5 * bin_deg, bin_deg)
         centers = 0.5 * (edges[:-1] + edges[1:])
         for ax, (p, g, title) in zip(axs[0], panels):
-            m = self._row_mask(p, g)
+            m = self._row_mask(p, ring_idx=g)
             a = self.angle_deg[m]
             if angle_range is not None:
                 a = (a - mid + 90.0) % 180.0 - 90.0 + mid

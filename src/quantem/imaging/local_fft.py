@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -90,7 +90,7 @@ class LocalFFT(AutoSerialize):
     image : Dataset2d
         The image, with its sampling converted to Angstroms when the units
         are known.
-    window_size, step, edge_width, k_max, fft_size, intensity, normalize, center_radius
+    window_size, step, edge_width, k_max, fft_size, normalize, center_radius
         See :meth:`from_image`.
     """
 
@@ -104,7 +104,6 @@ class LocalFFT(AutoSerialize):
         edge_width: float | None,
         k_max: float | None,
         fft_size: int,
-        intensity: str,
         normalize: bool,
         center_radius: float,
         _token: object | None = None,
@@ -118,7 +117,6 @@ class LocalFFT(AutoSerialize):
         self.edge_width = edge_width
         self.k_max = k_max
         self.fft_size = int(fft_size)
-        self.intensity = intensity
         self.normalize = bool(normalize)
         self.center_radius = float(center_radius)
         self.window = window_mask(self.window_size, edge_width)
@@ -136,7 +134,6 @@ class LocalFFT(AutoSerialize):
         edge_width: float | None = None,
         k_max: float | None = None,
         fft_size: int | None = None,
-        intensity: Literal["power", "amplitude"] = "power",
         normalize: bool = True,
         center_radius: float = 1.5,
         sampling: float | None = None,
@@ -175,10 +172,6 @@ class LocalFFT(AutoSerialize):
             Fourier transform size in pixels; the window is zero padded to it,
             which samples the pattern more finely without adding information.
             None (default) uses ``window_size``.
-        intensity : {"power", "amplitude"}, default="power"
-            Store the power spectrum ``|F| ** 2`` or the amplitude ``|F|``.
-            The amplitude compresses the range between strong and weak
-            fringes.
         normalize : bool, default=True
             Remove :attr:`background`, the azimuthal median of the scan-mean
             pattern, as ``I / background - 1``. The background is then 0 and
@@ -210,8 +203,6 @@ class LocalFFT(AutoSerialize):
         fft_size = window_size if fft_size is None else int(fft_size)
         if fft_size < window_size:
             raise ValueError("fft_size must be at least window_size.")
-        if intensity not in ("power", "amplitude"):
-            raise ValueError("intensity must be 'power' or 'amplitude'.")
         if min(image.shape) < window_size:
             raise ValueError("The window is larger than the image.")
 
@@ -222,7 +213,6 @@ class LocalFFT(AutoSerialize):
             edge_width=edge_width,
             k_max=k_max,
             fft_size=fft_size,
-            intensity=intensity,
             normalize=normalize,
             center_radius=center_radius,
             _token=cls._token,
@@ -286,49 +276,52 @@ class LocalFFT(AutoSerialize):
             raise ValueError("The image mean must be positive to normalize the contrast.")
         img = img / mean
 
-        n, s, nf = self.window_size, self.step, self.fft_size
-        num = [(size - n) // s + 1 for size in img.shape]
-        offset = [(size - n - (m - 1) * s) // 2 for size, m in zip(img.shape, num)]
-        rows = offset[0] + s * np.arange(num[0])
-        cols = offset[1] + s * np.arange(num[1])
+        window_size, step, fft_size = self.window_size, self.step, self.fft_size
+        num_windows = [(length - window_size) // step + 1 for length in img.shape]
+        margin = [
+            (length - window_size - (num - 1) * step) // 2
+            for length, num in zip(img.shape, num_windows)
+        ]
+        rows = margin[0] + step * np.arange(num_windows[0])
+        cols = margin[1] + step * np.arange(num_windows[1])
         self.corners = np.stack(np.meshgrid(rows, cols, indexing="ij"), axis=-1)
 
         # crop symmetric about zero frequency to an odd size, so the center is
         # a pixel and every spot keeps its Friedel mate
-        c = nf // 2
+        center = fft_size // 2
+        half_max = center - 1 if fft_size % 2 == 0 else center
         if self.k_max is None:
-            h = c - 1 if nf % 2 == 0 else c
+            half = half_max
         else:
-            h = min(int(np.floor(self.k_max / self.pixel_size)), c - 1 if nf % 2 == 0 else c)
-        crop = slice(c - h, c + h + 1)
-        size = 2 * h + 1
+            half = min(int(np.floor(self.k_max / self.pixel_size)), half_max)
+        crop = slice(center - half, center + half + 1)
+        num_k = 2 * half + 1
 
         dev = torch.device(device)
-        w = torch.as_tensor(self.window, device=dev)
-        w_sum = w.sum()
-        norm = (w * w).sum()
+        window = torch.as_tensor(self.window, device=dev)
+        window_sum = window.sum()
+        power_norm = (window * window).sum()
         image_t = torch.as_tensor(img, device=dev)
-        flat = self.corners.reshape(-1, 2)
-        out = np.empty((flat.shape[0], size, size), dtype=np.float32)
-        ar = torch.arange(n, device=dev)
-        for start in range(0, flat.shape[0], batch_size):
-            corner = torch.as_tensor(flat[start : start + batch_size], device=dev)
-            ri = (corner[:, 0, None] + ar[None, :])[:, :, None]
-            ci = (corner[:, 1, None] + ar[None, :])[:, None, :]
-            x = image_t[ri, ci]
-            x_mean = (x * w).sum(dim=(1, 2), keepdim=True) / w_sum
-            x = (x - x_mean) * w
-            F = torch.fft.fftshift(torch.fft.fft2(x, s=(nf, nf)), dim=(-2, -1))[:, crop, crop]
-            p = F.real**2 + F.imag**2
-            p = p / norm
-            if self.intensity == "amplitude":
-                p = torch.sqrt(p)
-            out[start : start + batch_size] = p.cpu().numpy()
+        corners = self.corners.reshape(-1, 2)
+        out = np.empty((corners.shape[0], num_k, num_k), dtype=np.float32)
+        offsets = torch.arange(window_size, device=dev)
+        for start in range(0, corners.shape[0], batch_size):
+            corner = torch.as_tensor(corners[start : start + batch_size], device=dev)
+            ri = (corner[:, 0, None] + offsets[None, :])[:, :, None]
+            ci = (corner[:, 1, None] + offsets[None, :])[:, None, :]
+            patch = image_t[ri, ci]
+            patch_mean = (patch * window).sum(dim=(1, 2), keepdim=True) / window_sum
+            patch = (patch - patch_mean) * window
+            spectrum = torch.fft.fftshift(
+                torch.fft.fft2(patch, s=(fft_size, fft_size)), dim=(-2, -1)
+            )[:, crop, crop]
+            power = (spectrum.real**2 + spectrum.imag**2) / power_norm
+            out[start : start + batch_size] = power.cpu().numpy()
 
         # azimuthal median of the mean pattern in 1 pixel shells, interpolated
         # linearly at the radius of every pixel so the background is smooth
-        x = np.arange(size) - h
-        r = np.hypot(x[:, None], x[None, :])
+        k_px = np.arange(num_k) - half
+        r = np.hypot(k_px[:, None], k_px[None, :])
         r_int = np.round(r).astype(int)
         mean_dp = out.mean(axis=0)
         profile = np.array([np.median(mean_dp[r_int == i]) for i in range(r_int.max() + 1)])
@@ -347,31 +340,26 @@ class LocalFFT(AutoSerialize):
         dk = self.pixel_size
         origin_image = np.asarray(self.image.origin, dtype=float)
         self.dataset = Dataset4dstem.from_array(
-            out.reshape(num[0], num[1], size, size),
+            out.reshape(num_windows[0], num_windows[1], num_k, num_k),
             name=f"{self.image.name} local FFT",
             origin=[
-                origin_image[0] + (offset[0] + (n - 1) / 2) * dx,
-                origin_image[1] + (offset[1] + (n - 1) / 2) * dx,
-                -h * dk,
-                -h * dk,
+                origin_image[0] + (margin[0] + (window_size - 1) / 2) * dx,
+                origin_image[1] + (margin[1] + (window_size - 1) / 2) * dx,
+                -half * dk,
+                -half * dk,
             ],
-            sampling=[s * dx, s * dx, dk, dk],
+            sampling=[step * dx, step * dx, dk, dk],
             units=["A", "A", "1/A", "1/A"],
-            signal_units=(
-                "ratio to background"
-                if self.normalize
-                else ("contrast^2" if self.intensity == "power" else "contrast")
-            ),
+            signal_units="ratio to background" if self.normalize else "contrast^2",
         )
         self.metadata.update(
-            center_px=float(h),
+            center_px=float(half),
             image_mean=mean,
-            window_size=n,
-            step=s,
+            window_size=window_size,
+            step=step,
             edge_width=self.edge_width,
-            fft_size=nf,
+            fft_size=fft_size,
             k_max=self.k_max,
-            intensity=self.intensity,
             normalize=self.normalize,
             center_radius=self.center_radius,
         )
