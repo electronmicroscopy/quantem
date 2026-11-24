@@ -161,14 +161,13 @@ def fit_elliptical_distortion(
     def residuals(x):
         return _amorphous_ring_model(model_params(x), d_row, d_col) - values
 
-    # A radius within 1% of the band width of a bound has been stopped there by it.
     edge_tol = 0.01 * (r_out - r_in)
     fits = []
     for seed in seeds:
         x = fit_from(seed)
         at_edge = bool(x[8] - r_in < edge_tol or r_out - x[8] < edge_tol)
         fits.append((at_edge, (residuals(x) ** 2).sum().item(), x))
-    # fits away from the edge first, then the lowest cost
+    # prefer fits not at the edge, then lower cost
     at_edge, cost, x = min(fits, key=lambda fit: fit[:2])
     if at_edge:
         warnings.warn(
