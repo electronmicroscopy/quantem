@@ -474,6 +474,10 @@ class BraggPeaksPolymer(BraggVectors):
         """``peaks`` with ``width_q`` and ``width_theta`` measured on the patterns."""
         from quantem.diffraction.polymer_ice import measure_peak_widths
 
+        if self.calibration is not None:
+            pixel_size, ellipse = self.calibration.pixel_size, self.calibration.ellipse
+        else:
+            pixel_size, ellipse = self._pixel_size(), None
         polar = peaks.numpy().astype(np.float64)
         widths = np.full((polar.shape[0], 2), np.nan)
         counts = np.asarray(peaks.row_counts(), dtype=int)
@@ -489,8 +493,9 @@ class BraggPeaksPolymer(BraggVectors):
                     np.asarray(self.dataset.array[r, c], dtype=float),
                     self.peaks[r, c].numpy().astype(np.float64)[local, :2],
                     self.origins[r, c],
-                    self._pixel_size(),
+                    pixel_size,
                     params,
+                    ellipse=ellipse,
                 )
             )
         return _nest(

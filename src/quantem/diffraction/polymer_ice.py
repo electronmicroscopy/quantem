@@ -75,6 +75,9 @@ class IceFlaggerParams:
         Gaussian smoothing of each profile, in samples, removed from the FWHM in quadrature.
     sharpness_crossing_persistence : int
         Samples a half-maximum crossing must stay below half to count.
+    sharpness_friedel_sum : bool
+        Add the pattern at the Friedel-opposite position to each profile before
+        measuring it, which doubles the signal of a centrosymmetric pattern.
     """
 
     q_target_invA: float = 1.61
@@ -96,6 +99,7 @@ class IceFlaggerParams:
     sharpness_refine_bins: int = 2
     sharpness_smooth_sigma_bins: float = 1.0
     sharpness_crossing_persistence: int = 3
+    sharpness_friedel_sum: bool = True
 
     def __post_init__(self):
         rules = [
@@ -166,13 +170,15 @@ def measure_peak_widths(
     origin: tuple[float, float],
     pixel_size: float,
     params: IceFlaggerParams | None = None,
+    ellipse: NDArray | None = None,
 ) -> tuple[NDArray, NDArray]:
     """Radial and annular FWHM of each peak in one diffraction pattern.
 
-    The pattern is sampled with bilinear interpolation along the arc about ``origin``
-    through each peak, in 1 degree steps, and then along the radial line through the
-    arc maximum, in 1 pixel steps. Each profile's FWHM is measured above a local
-    baseline, with the settings in ``params``.
+    Each peak is measured in the ellipse-corrected frame, where rings are circles.
+    The pattern is sampled with bilinear interpolation along the arc about
+    ``origin`` through the peak, in steps of 1 pixel of arc, and then along the
+    radial line through the arc maximum, in 1 pixel steps. Each profile's FWHM is
+    measured above a local baseline, with the settings in ``params``.
 
     Parameters
     ----------
@@ -183,9 +189,14 @@ def measure_peak_widths(
     origin : tuple of float
         (row, col) position of the direct beam.
     pixel_size : float
-        Detector pixel size in 1/Angstrom.
+        Pixel size of the ellipse-corrected frame in 1/Angstrom, as in
+        :class:`~quantem.diffraction.calibration.DiffractionCalibration`.
     params : IceFlaggerParams, optional
-        Window, baseline, smoothing and persistence settings.
+        Window, baseline, smoothing, persistence and Friedel-sum settings.
+    ellipse : array-like, optional
+        ``[e11, e12]`` elliptic distortion correction of
+        :class:`~quantem.diffraction.calibration.DiffractionCalibration`. None
+        treats the rings as circles.
 
     Returns
     -------
@@ -196,32 +207,47 @@ def measure_peak_widths(
         their window, or run off the detector first, read as wider than the window,
         and peaks with no maximum above the baseline are NaN.
     """
+    from quantem.diffraction.calibration import _ellipse_matrix
+
     p = IceFlaggerParams() if params is None else params
     image = torch.as_tensor(np.asarray(dp, dtype=np.float64))
     peaks = np.asarray(peaks_rc, dtype=np.float64).reshape(-1, 2)
     width_q, width_theta = np.full(len(peaks), np.nan), np.full(len(peaks), np.nan)
-    ok = np.isfinite(peaks).all(1)
-    if not ok.any():
-        return width_q, width_theta
-    r0, c0 = float(origin[0]), float(origin[1])
-    radius = np.hypot(peaks[ok, 0] - r0, peaks[ok, 1] - c0)[:, None]
-    phi = np.arctan2(peaks[ok, 0] - r0, peaks[ok, 1] - c0)[:, None]
+    origin = np.asarray(origin, dtype=np.float64)
+    to_circle = np.eye(2) if ellipse is None else _ellipse_matrix(ellipse)
+    to_detector = np.linalg.inv(to_circle)
 
-    # 1 degree samples; at most just under a full circle, so no sample repeats.
-    n_arc = min(max(2, math.ceil(p.sharpness_window_theta_deg)), 179)
-    angles = phi + np.deg2rad(np.arange(-n_arc, n_arc + 1))
-    arc = _sample(image, r0 + radius * np.sin(angles), c0 + radius * np.cos(angles))
-    fwhm_theta, at = _fwhm(arc, n_arc, p)
+    def profile(rows, cols):
+        # (row, col) offsets in the corrected frame -> samples of the pattern
+        offsets = np.stack([rows, cols], -1) @ to_detector.T
+        values = _sample(image, *(origin + offsets).transpose(2, 0, 1))
+        if p.sharpness_friedel_sum:
+            values = values + _sample(image, *(origin - offsets).transpose(2, 0, 1))
+        return values
 
     n_line = max(2, math.ceil(p.sharpness_window_q_invA / pixel_size))
-    radii = radius + np.arange(-n_line, n_line + 1)
-    angle = angles[np.arange(len(angles)), at][:, None]
-    line = _sample(image, r0 + radii * np.sin(angle), c0 + radii * np.cos(angle))
-    line[radii < 0] = np.nan
-    fwhm_q, _ = _fwhm(line, n_line, p)
+    for i in np.flatnonzero(np.isfinite(peaks).all(1)):
+        d = (peaks[i] - origin) @ to_circle.T
+        radius, phi = np.hypot(*d), np.arctan2(*d)
+        if radius == 0:
+            continue
+        step = 1.0 / radius  # 1 pixel of arc, in radians
+        # at most just under half a circle each way, so no sample repeats
+        n_arc = min(
+            max(2, math.ceil(np.deg2rad(p.sharpness_window_theta_deg) / step)),
+            int((np.pi - 1e-6) / step),
+        )
+        angles = phi + step * np.arange(-n_arc, n_arc + 1)[None]
+        fwhm_theta, at = _fwhm(profile(radius * np.sin(angles), radius * np.cos(angles)), n_arc, p)
 
-    width_q[ok] = fwhm_q * pixel_size
-    width_theta[ok] = np.deg2rad(fwhm_theta)
+        radii = radius + np.arange(-n_line, n_line + 1)[None]
+        angle = angles[0, at[0]]
+        line = profile(radii * np.sin(angle), radii * np.cos(angle))
+        line[radii < 0] = np.nan
+        fwhm_q, _ = _fwhm(line, n_line, p)
+
+        width_q[i] = fwhm_q[0] * pixel_size
+        width_theta[i] = fwhm_theta[0] * step
     return width_q, width_theta
 
 

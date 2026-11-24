@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from quantem.core.datastructures import Vector
+from quantem.diffraction.calibration import _ellipse_matrix, ellipse_from_axes
 from quantem.diffraction.polymer_ice import IceFlaggerParams, detect_ice, measure_peak_widths
 
 FIELDS = ["q", "theta", "intensity"]
@@ -71,20 +72,33 @@ def test_detect_ice_flags_six_fold_sets_and_filter_removes_them():
 def test_measure_peak_widths_and_sharpness_gate():
     origin, pixel_size, radius = (47.3, 48.6), 0.04, 1.61 / 0.04
     rows, cols = np.mgrid[:96, :96].astype(float)
-    dr, dc = rows - origin[0], cols - origin[1]
     sigma, sigma_arc = 3.0 / 2.3548, np.deg2rad(40.0) / 2.3548  # FWHM 3 px and 40 deg
-    angles = np.deg2rad([30.0, 90.0])
-    peaks_rc = np.array(origin) + radius * np.column_stack([np.sin(angles), np.cos(angles)])
-    spot = np.exp(-((rows - peaks_rc[0, 0]) ** 2 + (cols - peaks_rc[0, 1]) ** 2) / (2 * sigma**2))
-    dt = (np.arctan2(dr, dc) - angles[1] + np.pi) % (2 * np.pi) - np.pi
-    arc = np.exp(-((np.hypot(dr, dc) - radius) ** 2) / (2 * sigma**2) - dt**2 / (2 * sigma_arc**2))
-    dp = spot + arc + np.random.default_rng(0).normal(0, 0.03, spot.shape)
-
+    angles = np.deg2rad([30.0, 90.0, 270.0])
+    unit = np.column_stack([np.sin(angles), np.cos(angles)])
     params = IceFlaggerParams(sharpness_window_q_invA=0.2)
-    width_q, width_theta = measure_peak_widths(dp, peaks_rc, origin, pixel_size, params)
-    assert width_q == pytest.approx([0.12, 0.12], abs=0.015)
-    assert np.rad2deg(width_theta) == pytest.approx([np.rad2deg(3.0 / radius), 40.0], rel=0.2)
+    for ellipse in (None, ellipse_from_axes(1.05, 0.95, 25.0)):
+        to_circle = np.eye(2) if ellipse is None else _ellipse_matrix(ellipse)
+        d = np.stack([rows - origin[0], cols - origin[1]], -1) @ to_circle.T
+        dr, dc = d[..., 0], d[..., 1]
+        spot = np.exp(
+            -((dr - radius * unit[0, 0]) ** 2 + (dc - radius * unit[0, 1]) ** 2) / (2 * sigma**2)
+        )
+        dt = (np.arctan2(dr, dc) - angles[1] + np.pi) % (2 * np.pi) - np.pi
+        arc = np.exp(
+            -((np.hypot(dr, dc) - radius) ** 2) / (2 * sigma**2) - dt**2 / (2 * sigma_arc**2)
+        )
+        dp = spot + arc + np.random.default_rng(0).normal(0, 0.03, spot.shape)
+        peaks_rc = np.array(origin) + (radius * unit) @ np.linalg.inv(to_circle).T
 
+        width_q, width_theta = measure_peak_widths(
+            dp, peaks_rc, origin, pixel_size, params, ellipse=ellipse
+        )
+        assert width_q == pytest.approx([0.12] * 3, abs=0.015), ellipse
+        expected_theta = [np.rad2deg(3.0 / radius), 40.0, 40.0]
+        assert np.rad2deg(width_theta) == pytest.approx(expected_theta, rel=0.2), ellipse
+
+    width_q, width_theta = width_q[:2], width_theta[:2]
+    angles = angles[:2]
     cell = np.column_stack([[1.61, 1.61], angles, [1.0, 1.0], width_q, width_theta])
     peaks = Vector.from_data([[cell]], fields=FIELDS + ["width_q", "width_theta"])
     for ceiling, expected in ((None, [True, True]), (15.0, [True, False])):
