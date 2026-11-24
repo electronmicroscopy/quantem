@@ -1,5 +1,3 @@
-"""Diffraction analysis interfaces."""
-
 from quantem.diffraction.polar import PairDistributionFunction as PairDistributionFunction
 from quantem.diffraction.bragg_vectors import BraggVectors as BraggVectors
 from quantem.diffraction.crystal import Crystal as Crystal
@@ -16,78 +14,7 @@ from quantem.diffraction import crystal_rotations as crystal_rotations
 from quantem.diffraction import digital_dark_field as digital_dark_field
 from quantem.diffraction import ellipticity as ellipticity
 from quantem.diffraction import illumination as illumination
-
-from quantem.diffraction.bragg_peaks import BraggPeaksPolymer
-from quantem.diffraction.scan_mask import ScanMaskShape
-from quantem.diffraction.polymer_models import (
-    PAPER_MODEL_ID,
-    PAPER_MODEL_VERSION,
-    PolymerModelError,
-    PolymerModelResolution,
-    resolve_polymer_model,
-)
-from quantem.diffraction.polymer_ice import (
-    IceDetectionResult,
-    IceFlaggerDebug,
-    IceFlaggerParams,
-    apply_ice_mask_to_vector,
-    collect_peak_widths,
-    compute_global_intensity_threshold,
-    detect_ice,
-    flag_ice_peaks_in_dataset,
-    flag_ice_peaks_in_pattern,
-    measure_peak_widths,
-    sharpness_mask,
-    plot_q_intensity_density,
-)
-from quantem.diffraction.polymer_normalization import (
-    GlobalPercentileNormalization,
-    GlobalPercentileStrategy,
-    LegacyNormalizationAdapter,
-    NormalizationStrategy,
-    PerImageMinMaxPercentileNormalization,
-    PerImageMinMaxPercentileStrategy,
-    resolve_normalization_strategy,
-)
-
-__all__ = [
-    "BraggVectors",
-    "Crystal",
-    "CrystalMap",
-    "OrientationMap",
-    "PairDistributionFunction",
-    "PhaseMap",
-    "ReverseMonteCarlo",
-    "StrainMap",
-    "bloch",
-    "calibration",
-    "digital_dark_field",
-    "illumination",
-    "rotations",
-    "BraggPeaksPolymer",
-    "ScanMaskShape",
-    "GlobalPercentileNormalization",
-    "GlobalPercentileStrategy",
-    "IceDetectionResult",
-    "IceFlaggerDebug",
-    "IceFlaggerParams",
-    "measure_peak_widths",
-    "sharpness_mask",
-    "LegacyNormalizationAdapter",
-    "NormalizationStrategy",
-    "PAPER_MODEL_ID",
-    "PAPER_MODEL_VERSION",
-    "PolymerModelError",
-    "PolymerModelResolution",
-    "PerImageMinMaxPercentileNormalization",
-    "PerImageMinMaxPercentileStrategy",
-    "apply_ice_mask_to_vector",
-    "compute_global_intensity_threshold",
-    "collect_peak_widths",
-    "detect_ice",
-    "flag_ice_peaks_in_dataset",
-    "flag_ice_peaks_in_pattern",
-    "plot_q_intensity_density",
-    "resolve_polymer_model",
-    "resolve_normalization_strategy",
-]
+from quantem.diffraction.polymer import BraggPeaksPolymer as BraggPeaksPolymer
+from quantem.diffraction import polymer_orientation as polymer_orientation
+from quantem.diffraction import polymer_ice as polymer_ice
+from quantem.diffraction import orientation_correlation as orientation_correlation

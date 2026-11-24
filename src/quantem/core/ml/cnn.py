@@ -1,6 +1,5 @@
 from typing import Callable
 
-import numpy as np
 import torch
 import torch.nn as nn
 
@@ -26,7 +25,6 @@ class CNN2d(nn.Module):
         num_layers: int = 3,
         num_per_layer: int = 2,
         use_skip_connections: bool = True,
-        conv_kernel_size: int = 3,
         dtype: torch.dtype = torch.float32,
         dropout: float = 0,
         activation: str | Callable = "relu",
@@ -49,9 +47,6 @@ class CNN2d(nn.Module):
             Number of conv blocks per CNN layer, by default 2
         use_skip_connections : bool, optional
             Whether to use skip connections, by default True
-        conv_kernel_size : int, optional
-            The size of the convolution kernel in pixels. Default is a 3x3 kernel.
-            It must be an integer which is positive and odd.
         dtype : torch.dtype, optional
             Data type for the network, by default torch.float32
         dropout : float, optional
@@ -80,16 +75,6 @@ class CNN2d(nn.Module):
                 + "channel concatenation."
             )
         self.use_skip_connections = use_skip_connections
-        if (
-            not isinstance(conv_kernel_size, (int, np.integer))
-            or conv_kernel_size < 0
-            or conv_kernel_size % 2 == 0
-        ):
-            raise ValueError(
-                "The convolution kernel size must be an integer which is positive and odd. "
-                f"The input kernel size is {conv_kernel_size}"
-            )
-        self.conv_kernel_size = conv_kernel_size
         self.dtype = dtype
         self.dropout = dropout
         self._use_batchnorm = use_batchnorm
@@ -140,8 +125,6 @@ class CNN2d(nn.Module):
                     nb_layers=self._num_per_layer,
                     input_channels=in_channels,
                     output_channels=out_channels,
-                    kernel_size=self.conv_kernel_size,
-                    padding=self.conv_kernel_size // 2,
                     use_batchnorm=self._use_batchnorm,
                     dropout=self.dropout,
                     dtype=self.dtype,
@@ -155,8 +138,6 @@ class CNN2d(nn.Module):
             nb_layers=self._num_per_layer,
             input_channels=in_channels,
             output_channels=out_channels,
-            kernel_size=self.conv_kernel_size,
-            padding=self.conv_kernel_size // 2,
             use_batchnorm=self._use_batchnorm,
             dropout=self.dropout,
             dtype=self.dtype,
@@ -180,8 +161,6 @@ class CNN2d(nn.Module):
                     nb_layers=self._num_per_layer,
                     input_channels=in_channels2,
                     output_channels=out_channels,
-                    kernel_size=self.conv_kernel_size,
-                    padding=self.conv_kernel_size // 2,
                     use_batchnorm=self._use_batchnorm,
                     dropout=self.dropout,
                     dtype=self.dtype,
@@ -195,8 +174,6 @@ class CNN2d(nn.Module):
             nb_layers=1,
             input_channels=self.start_filters,
             output_channels=self.out_channels,
-            kernel_size=self.conv_kernel_size,
-            padding=self.conv_kernel_size // 2,
             use_batchnorm=False,
             dropout=self.dropout,
             dtype=self.dtype,

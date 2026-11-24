@@ -887,6 +887,21 @@ def _ellipse_matrix(ellipse) -> np.ndarray:
     return np.array([[1 + e11, e12], [e12, 1 - e11]])
 
 
+def ellipse_from_axes(a: float, b: float, theta_deg: float) -> np.ndarray:
+    """[e11, e12] correction for a measured ellipse with semiaxes a, b.
+
+    Converts the ``(a, b, theta_deg)`` of
+    :func:`~quantem.diffraction.ellipticity.fit_elliptical_distortion` and
+    :func:`~quantem.diffraction.polar_transform.polar_transform` (major axis at
+    ``theta_deg`` from the column axis towards +row) into the correction used by
+    :class:`DiffractionCalibration`, which maps the ellipse onto a circle of
+    radius ``2ab / (a + b)``.
+    """
+    e = (a - b) / (a + b)
+    t = np.deg2rad(2.0 * theta_deg)
+    return np.array([e * np.cos(t), -e * np.sin(t)])
+
+
 def _compose_ellipse(ellipse_new, ellipse_prev) -> np.ndarray:
     """One ellipse equivalent to applying `ellipse_prev`, then `ellipse_new`.
 
