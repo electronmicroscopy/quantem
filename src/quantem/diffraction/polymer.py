@@ -264,6 +264,8 @@ class BraggPeaksPolymer(BraggVectors):
         energy: float | None = None,
         mask: np.ndarray | None = None,
         multi_seed: bool = False,
+        rotation_ccw_deg: float | None = None,
+        transpose: bool | None = None,
     ) -> DiffractionCalibration:
         """Calibrate from the amorphous ring of the origin-aligned mean pattern.
 
@@ -272,7 +274,7 @@ class BraggPeaksPolymer(BraggVectors):
         ellipticity. The ring is fit by
         :func:`~quantem.diffraction.ellipticity.fit_elliptical_distortion`, with
         ``n_harmonics`` angular harmonics in its amplitude so texture is not read
-        as ellipticity. The scan rotation comes from the dataset metadata.
+        as ellipticity.
 
         Parameters
         ----------
@@ -295,6 +297,16 @@ class BraggPeaksPolymer(BraggVectors):
             Also start the ring fit from radii across ``fit_radii`` (see
             :func:`~quantem.diffraction.ellipticity.fit_elliptical_distortion`).
             Try it if the fit ends at the edge of ``fit_radii``.
+        rotation_ccw_deg : float, optional
+            Counter-clockwise diffraction-to-scan rotation in degrees, recorded
+            on the calibration. None (default) takes the dataset's
+            ``q_to_r_rotation_ccw_deg`` (from :meth:`measure_scan_rotation`,
+            ptychography or set by hand), else 0. A value given here is
+            written to the dataset metadata, so strain mapping and
+            ptychography use the same frame.
+        transpose : bool, optional
+            Detector axes swapped before the rotation; None (default) takes
+            the dataset's ``q_transpose``, else False.
 
         Returns
         -------
@@ -326,11 +338,13 @@ class BraggPeaksPolymer(BraggVectors):
                 f"The ring fit ended at the edge of fit_radii {fit_radii}. Choose fit_radii "
                 "around a single ring, or pass multi_seed=True."
             )
-        rotation, transpose, _ = self._scan_rotation(None, None)
+        rotation_ccw_deg, transpose, known = self._scan_rotation(rotation_ccw_deg, transpose)
+        if known:
+            self._record_scan_rotation(rotation_ccw_deg, transpose)
         self.calibration = DiffractionCalibration(
             self._pixel_size(pixel_size, energy),
             ellipse=ellipse_from_axes(*fit["ellipse_params"]),
-            rotation_ccw_deg=rotation,
+            rotation_ccw_deg=rotation_ccw_deg,
             transpose=transpose,
             metadata={
                 "method": "amorphous ring",
