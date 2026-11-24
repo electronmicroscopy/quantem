@@ -112,8 +112,9 @@ def _bary_to_rgb(
 
 def _parse_direction(direction) -> torch.Tensor:
     """Lab direction for IPF coloring: 'z' (beam), 'r' (scan row), 'c' (scan
-    col), an in-plane angle in degrees (measured from the column axis toward
-    the row axis), or an explicit [row, col] / [row, col, z] vector."""
+    col), an in-plane angle in degrees (measured from the row axis toward the
+    column axis, so 0 is 'r' and 90 is 'c'), or an explicit [row, col] /
+    [row, col, z] vector."""
     if isinstance(direction, str):
         return {
             "z": torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64),
@@ -125,7 +126,7 @@ def _parse_direction(direction) -> torch.Tensor:
         }[direction]
     if isinstance(direction, (int, float)):
         th = np.deg2rad(float(direction))
-        return torch.tensor([np.sin(th), np.cos(th), 0.0], dtype=torch.float64)
+        return torch.tensor([np.cos(th), np.sin(th), 0.0], dtype=torch.float64)
     v = torch.as_tensor(direction, dtype=torch.float64).reshape(-1)
     if v.numel() == 2:
         v = torch.cat([v, torch.zeros(1, dtype=torch.float64)])
@@ -178,9 +179,9 @@ def ipf_color(
         Lab direction whose crystal-frame coordinates are colored: "z" is
         the beam direction (zone-axis map), "r" the scan row axis and "c"
         the scan column axis ("x" and "y" are accepted as aliases of "r"
-        and "c"). A number is an in-plane angle in degrees from the column
-        axis toward the row axis; a 2 or 3 element vector is an explicit
-        (row, col[, z]) direction.
+        and "c"). A number is an in-plane angle in degrees from the row
+        axis toward the column axis (0 is "r", 90 is "c"); a 2 or 3 element
+        vector is an explicit (row, col[, z]) direction.
     saturation_power : float, default=0.5
         Width of the white centre; see :func:`_bary_to_rgb`.
     chroma : float, default=1.0
@@ -253,13 +254,13 @@ def fold_in_plane(quats: torch.Tensor, crystal: Crystal, strict: bool = False) -
     if bool((n_proj <= 1).all()):
         return q
     a_lab = R[:, :, 0]
-    ang = torch.rad2deg(torch.atan2(a_lab[:, 0], a_lab[:, 1]))
+    # in-plane angle from the row axis toward the column axis, the sense of
+    # a right-handed rotation about the beam, so rotating by -delta removes it
+    ang = torch.rad2deg(torch.atan2(a_lab[:, 1], a_lab[:, 0]))
     sector = 360.0 / n_proj
     delta = ang - (ang % sector)
-    # the in-plane angle is measured from the column axis toward the row
-    # axis, which runs opposite to a right-handed rotation about the beam
     beam = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64)
-    dq = quat_from_axis_angle(beam, torch.deg2rad(delta))
+    dq = quat_from_axis_angle(beam, torch.deg2rad(-delta))
     return qnormalize(qmult(dq, flat)).reshape(*shape, 4)
 
 
@@ -386,8 +387,8 @@ def plot_orientation_map(
     direction : {"z", "r", "c"} | float | array-like, default="z"
         Lab direction to color: "z" the beam (zone axis), "r" the scan row
         axis, "c" the scan column axis ("x" and "y" are aliases of "r" and
-        "c"), a number for an in-plane angle in degrees, or an explicit
-        vector; see :func:`ipf_color`.
+        "c"), a number for an in-plane angle in degrees from the row axis
+        toward the column axis, or an explicit vector; see :func:`ipf_color`.
     match : int, default=0
         Which match index to plot.
     mask : np.ndarray | None
@@ -498,7 +499,9 @@ def plot_orientation_map(
             label = {"x": "r", "y": "c"}.get(direction, direction)
             ax.set_title(f"{om.crystal.name}  in-plane orientation  {label} {arrow}")
         elif isinstance(direction, (int, float)):
-            ax.set_title(f"{om.crystal.name}  in-plane orientation  ({direction:g}\u00b0)")
+            ax.set_title(
+                f"{om.crystal.name}  in-plane orientation  {direction:g}\u00b0 from r toward c"
+            )
         else:
             ax.set_title(f"{om.crystal.name}  in-plane orientation")
     if scalebar is not None:
@@ -1014,6 +1017,30 @@ def _pole_scatter_xy(quats: torch.Tensor, crystal: Crystal, pole) -> np.ndarray:
     return np.stack((x, y), axis=1)
 
 
+def _scan_axes_glyph(ax) -> None:
+    """Scan-axes arrows in the top-left corner of a pole figure.
+
+    Pole figures are drawn in the scan (image) frame, column axis rightward
+    and row axis downward, so a pole at in-plane angle t from the row axis
+    toward the column axis sits where an orientation map shows that
+    direction.
+    """
+    gx, gy = -1.06, -1.06
+    for dx, dy, lbl, ha, va in (
+        (0.22, 0.0, "c", "left", "center"),
+        (0.0, 0.22, "r", "center", "top"),
+    ):
+        ax.annotate(
+            "",
+            xy=(gx + dx, gy + dy),
+            xytext=(gx, gy),
+            arrowprops=dict(arrowstyle="-|>", color="0.3", lw=1.2),
+            annotation_clip=False,
+        )
+        ax.text(gx + dx * 1.25, gy + dy * 1.25, lbl, fontsize=9, ha=ha, va=va, color="0.3")
+    ax.text(gx - 0.03, gy - 0.06, "scan axes", fontsize=7, ha="left", va="bottom", color="0.45")
+
+
 def plot_cluster_pole_figure(
     om,
     clusters: dict,
@@ -1074,9 +1101,10 @@ def plot_cluster_pole_figure(
     K = clusters["mean_quats"].shape[0]
     for k in range(K):
         xy = _pole_scatter_xy(clusters["mean_quats"][k], om.crystal, pole)
+        # image frame, as plot_pole_figure: horizontal = col, vertical = row
         ax.scatter(
-            xy[:, 0],
             xy[:, 1],
+            xy[:, 0],
             s=60,
             marker="h",
             color=colors[k % len(colors)],
@@ -1087,8 +1115,8 @@ def plot_cluster_pole_figure(
     if overlay is not None:
         xy = _pole_scatter_xy(overlay["quats"], overlay["crystal"], overlay["pole"])
         ax.scatter(
-            xy[:, 0],
             xy[:, 1],
+            xy[:, 0],
             s=70,
             marker="D",
             facecolors="none",
@@ -1096,11 +1124,13 @@ def plot_cluster_pole_figure(
             lw=1.0,
             label=overlay.get("label", "overlay"),
         )
+    _scan_axes_glyph(ax)
     ax.set_xlim(-1.15, 1.15)
-    ax.set_ylim(-1.15, 1.15)
+    ax.set_ylim(1.2, -1.2)
     ax.set_aspect("equal")
     ax.set_xticks([])
     ax.set_yticks([])
+    ax.set_frame_on(False)
     ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=8)
     ax.set_title(f"{om.crystal.name} cluster pole figure")
     return fig, ax
@@ -1268,38 +1298,7 @@ def plot_pole_figure(
         for az in range(0, 180, 30):
             ca, sa = np.cos(np.deg2rad(az)), np.sin(np.deg2rad(az))
             ax.plot([-ca, ca], [-sa, sa], color="0.85", lw=0.4)
-        # compact scan-axes glyph, top-left corner: the pole figure is in
-        # the scan (image) frame -- c rightward, r downward
-        gx, gy = -1.06, -1.06
-        for dx, dy, lbl, ha, va in (
-            (0.22, 0.0, "c", "left", "center"),
-            (0.0, 0.22, "r", "center", "top"),
-        ):
-            ax.annotate(
-                "",
-                xy=(gx + dx, gy + dy),
-                xytext=(gx, gy),
-                arrowprops=dict(arrowstyle="-|>", color="0.3", lw=1.2),
-                annotation_clip=False,
-            )
-            ax.text(
-                gx + dx * 1.25,
-                gy + dy * 1.25,
-                lbl,
-                fontsize=9,
-                ha=ha,
-                va=va,
-                color="0.3",
-            )
-        ax.text(
-            gx - 0.03,
-            gy - 0.06,
-            "scan axes",
-            fontsize=7,
-            ha="left",
-            va="bottom",
-            color="0.45",
-        )
+        _scan_axes_glyph(ax)
     if overlay is not None:
         if "om" in overlay:
             # raw-histogram contour of another map's pole family

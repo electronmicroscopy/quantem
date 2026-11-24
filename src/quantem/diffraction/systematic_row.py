@@ -32,8 +32,9 @@ class SystematicRowMap(AutoSerialize):
     fringe sets.
 
     The in-plane angle of g is ``atan2(g_col, g_row)``, measured from the scan
-    row axis toward the column axis, the azimuth convention of the quantEM
-    calibration and orientation matching, and wrapped to [0, 180) degrees
+    row axis toward the column axis, the in-plane convention of the quantEM
+    calibration, orientation matching and
+    :meth:`OrientationMap.in_plane_angle_deg`, and wrapped to [0, 180) degrees
     since g and -g give the same fringes. The lattice fringes run
     perpendicular to g.
 

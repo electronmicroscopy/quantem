@@ -2676,8 +2676,14 @@ class OrientationMap(AutoSerialize):
     ) -> torch.Tensor:
         """In-plane angle of the crystal a-axis at every position (degrees).
 
-        The angle of the projected crystal [100] Cartesian axis, measured
-        from the scan column axis toward the row axis.
+        The angle of the projected crystal [100] Cartesian axis,
+        ``atan2(a_col, a_row)``, measured from the scan row axis toward the
+        column axis. This is the sense of a right-handed rotation about the
+        beam, so an orientation built with
+        ``quat_from_zone_axis(zone, in_plane_deg=t)`` reads ``t`` for a
+        zone axis along the crystal z axis, and it is the in-plane angle
+        convention of the calibration and of
+        :class:`~quantem.diffraction.SystematicRowMap`.
 
         `mod_deg` wraps the angle, which is what makes the map continuous
         where the in-plane orientation is not uniquely indexable. The default
@@ -2695,7 +2701,7 @@ class OrientationMap(AutoSerialize):
         assert self.quats is not None
         R = quat_to_matrix(self.quats[..., match, :])
         a_lab = R[..., :, 0]  # crystal x-axis in the lab frame
-        ang = torch.rad2deg(torch.atan2(a_lab[..., 0], a_lab[..., 1]))
+        ang = torch.rad2deg(torch.atan2(a_lab[..., 1], a_lab[..., 0]))
         if isinstance(mod_deg, str):
             if mod_deg != "auto":
                 raise ValueError('mod_deg must be a number, None, or "auto"')
