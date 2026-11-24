@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+from ase import Atoms
 from ase.build import bulk
 from scipy.special import eval_legendre
 
@@ -13,6 +14,7 @@ from quantem.diffraction.lattices import (
     probe_patterns,
 )
 from quantem.diffraction.multislice import circular_window
+from quantem.diffraction.wk_scattering_factors import compute_WK_factor
 from quantem.diffraction.pvc import (
     PairVectorCorrelation,
     _cluster_power_sphere,
@@ -146,7 +148,9 @@ def test_miscentered_pattern_warns(triangular):
 def test_probe_patterns_bright_field_and_kinematic_limit():
     """The bright-field disk of multislice patterns of a nanocrystalline film is
     measured at its radius alpha / lambda, and single scattering by this thin
-    film matches multislice outside the disk."""
+    film matches multislice outside the disk. Under plane-wave illumination,
+    single scattering by a Mo-S film equals the sum over atoms with their own
+    scattering factors, each at its own depth on the Ewald sphere."""
     film = polycrystal(bulk("Si", "diamond", a=5.431, cubic=True), 8.0, 24.0, 8.0, seed=0)
     ds = probe_patterns(film, 4, 10.0, q_max=1.0)
     pvc = PairVectorCorrelation(ds, energy=200e3)
@@ -160,6 +164,29 @@ def test_probe_patterns_bright_field_and_kinematic_limit():
     dynamic = ds.array[..., outside]
     error = np.linalg.norm(kinematic[..., outside] - dynamic) / np.linalg.norm(dynamic)
     assert error < 0.06, error
+
+    rng = np.random.default_rng(0)
+    width, thickness, energy = 10.0, 6.0, 200e3
+    mixed = Atoms(
+        numbers=rng.choice([16, 42], 30),
+        positions=rng.random((30, 3)) * [width, width, thickness],
+        cell=[width, width, thickness],
+    )
+    pattern = probe_patterns(mixed, 1, 1e-3, energy=energy, q_max=2.0, slice_thickness=2.0, kinematic=True)
+    n = pattern.shape[-1]
+    k = (np.arange(n) - n // 2) / width
+    q = np.hypot(*np.meshgrid(k, k, indexing="ij"))
+    amplitude = 0
+    for pos, z in zip(mixed.positions, mixed.numbers):
+        depth = 1j * np.pi * electron_wavelength_angstrom(energy) * pos[2] * k**2
+        amplitude = amplitude + compute_WK_factor(q.ravel(), int(z), energy).reshape(q.shape) * np.outer(
+            np.exp(-2j * np.pi * pos[0] * k + depth), np.exp(-2j * np.pi * pos[1] * k + depth)
+        )
+    ring = (q > 0.05) & (q < 1.9)
+    expected, simulated = np.abs(amplitude[ring]) ** 2, pattern.array[0, 0][ring]
+    scale = (simulated @ expected) / (simulated @ simulated)
+    error = np.linalg.norm(scale * simulated - expected) / np.linalg.norm(expected)
+    assert error < 1e-4, error
 
 
 def test_split_counts_removes_shot_noise_bias():
