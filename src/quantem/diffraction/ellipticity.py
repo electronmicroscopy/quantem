@@ -19,6 +19,7 @@ def fit_elliptical_distortion(
     device: str = "cpu",
     max_iter: int = 500,
     write_metadata: bool = True,
+    multi_seed: bool = False,
 ) -> dict:
     """Fit the elliptical distortion of a diffraction pattern from its amorphous ring.
 
@@ -51,6 +52,11 @@ def fit_elliptical_distortion(
         Maximum number of iterations.
     write_metadata : bool
         If True, store the fitted ellipse in ``data.metadata["ellipticity"]``.
+    multi_seed : bool
+        If True, also start the fit from ring radii every 2 px across ``fit_radii``
+        and keep the lowest-cost fit whose radius is not at the edge of
+        ``fit_radii``. Use it when the default fit ends at the edge. Cannot be
+        combined with ``p0``.
 
     Returns
     -------
@@ -59,8 +65,13 @@ def fit_elliptical_distortion(
         the tilt of the major axis from the column axis in degrees, in [-90, 90), as
         used by :func:`polar_transform`. ``"center"``: refined (row, col).
         ``"fit_params"``: the 11 + 2 * n_harmonics fitted model parameters.
-        ``"cost"``: sum of squared residuals.
+        ``"cost"``: sum of squared residuals. ``"at_edge"``: True if the fitted ring
+        radius is at the edge of ``fit_radii``, which means the fit failed.
     """
+    if multi_seed and p0 is not None:
+        raise ValueError(
+            "multi_seed chooses its own starting points: pass p0 or multi_seed, not both."
+        )
     dp = (
         torch.from_numpy(np.ascontiguousarray(data.array))
         if data.array is not None
@@ -92,13 +103,8 @@ def fit_elliptical_distortion(
     if values.numel() == 0:
         raise ValueError("No pixels in the fitting annulus. Check center and fit_radii.")
 
-    if p0 is None:
-        # ring radius = peak of the annulus intensity summed in radial bins
-        n_bins = max(int(r_out - r_in), 10)
-        bin_width = (r_out - r_in) / n_bins
-        bins = ((r - r_in) / bin_width).long().clamp(0, n_bins - 1)
-        radial_sum = torch.zeros(n_bins, device=device).scatter_add_(0, bins, values)
-        R = r_in + (radial_sum.argmax().item() + 0.5) * bin_width
+    def initial_params(R):
+        # start from a circle of radius R centered on the nominal center
         near_ring = values[(r - R).abs() < 3.0]
         if near_ring.numel() == 0:
             raise ValueError(
@@ -108,27 +114,44 @@ def fit_elliptical_distortion(
         background = max(values.min().item(), 0.0)
         I1 = max(near_ring.mean().item() - background, 0.0)
         I0 = max(dp[int(row_c), int(col_c)].item() - background, 0.0)
-        # start from a circle of radius R centered on the nominal center
         p0 = [I0, I1, R * 0.3, R * 0.15, R * 0.2, background, 0.0, 0.0]
-        p0 += convert_ellipse_params_r(R, R, 0.0)
-    p0 = torch.as_tensor(p0, dtype=torch.float32, device=device)
+        return p0 + list(convert_ellipse_params_r(R, R, 0.0))
+
+    if p0 is not None:
+        seeds = [p0]
+    else:
+        # ring radius = peak of the annulus intensity summed in radial bins
+        n_bins = max(int(r_out - r_in), 10)
+        bin_width = (r_out - r_in) / n_bins
+        bins = ((r - r_in) / bin_width).long().clamp(0, n_bins - 1)
+        radial_sum = torch.zeros(n_bins, device=device).scatter_add_(0, bins, values)
+        seeds = [initial_params(r_in + (radial_sum.argmax().item() + 0.5) * bin_width)]
+        if multi_seed:
+            seeds += [
+                initial_params(R)
+                for R in np.arange(r_in + 2.0, r_out - 1.0, 2.0)
+                if ((r - R).abs() < 3.0).any()
+            ]
 
     # The fit varies x = (I0, I1, sigma0, sigma1, sigma2, background, row0, col0, R, e1, e2),
     # describing the ring ellipse by its mean radius R and ellipticity (e1, e2) (see
     # _conic_from_shape), which keeps the fit well conditioned, then the ring-amplitude
     # harmonics. Bounds: amplitudes and background >= 0, R inside fit_radii, |e1| and
     # |e2| <= 0.5, harmonics in [-1, 1].
-    a0, b0, theta0 = convert_ellipse_params(*p0[8:11].tolist())
-    e0 = (a0 - b0) / (a0 + b0)
-    shape0 = [(a0 + b0) / 2, e0 * math.cos(2 * theta0), e0 * math.sin(2 * theta0)]
-    harmonics0 = p0[11:] if p0.numel() > 11 else p0.new_zeros(2 * n_harmonics)
-    x = torch.cat([p0[:8], p0.new_tensor(shape0), harmonics0])
-    lower = torch.full_like(x, -math.inf)
-    upper = torch.full_like(x, math.inf)
-    lower[[0, 1, 5]] = 0.0
-    lower[8], upper[8] = r_in, r_out
-    lower[9:11], upper[9:11] = -0.5, 0.5
-    lower[11:], upper[11:] = -1.0, 1.0
+    def fit_from(p0):
+        p0 = torch.as_tensor(p0, dtype=torch.float32, device=device)
+        a0, b0, theta0 = convert_ellipse_params(*p0[8:11].tolist())
+        e0 = (a0 - b0) / (a0 + b0)
+        shape0 = [(a0 + b0) / 2, e0 * math.cos(2 * theta0), e0 * math.sin(2 * theta0)]
+        harmonics0 = p0[11:] if p0.numel() > 11 else p0.new_zeros(2 * n_harmonics)
+        x = torch.cat([p0[:8], p0.new_tensor(shape0), harmonics0])
+        lower = torch.full_like(x, -math.inf)
+        upper = torch.full_like(x, math.inf)
+        lower[[0, 1, 5]] = 0.0
+        lower[8], upper[8] = r_in, r_out
+        lower[9:11], upper[9:11] = -0.5, 0.5
+        lower[11:], upper[11:] = -1.0, 1.0
+        return _least_squares(residuals, x.clamp(lower, upper), lower, upper, max_iter)
 
     def model_params(x):
         # the widths enter the model squared, so their sign does not matter
@@ -138,8 +161,16 @@ def fit_elliptical_distortion(
     def residuals(x):
         return _amorphous_ring_model(model_params(x), d_row, d_col) - values
 
-    x = _least_squares(residuals, x.clamp(lower, upper), lower, upper, max_iter)
-    if x[8] <= r_in or x[8] >= r_out:
+    # A radius within 1% of the band width of a bound has been stopped there by it.
+    edge_tol = 0.01 * (r_out - r_in)
+    fits = []
+    for seed in seeds:
+        x = fit_from(seed)
+        at_edge = bool(x[8] - r_in < edge_tol or r_out - x[8] < edge_tol)
+        fits.append((at_edge, (residuals(x) ** 2).sum().item(), x))
+    # fits away from the edge first, then the lowest cost
+    at_edge, cost, x = min(fits, key=lambda fit: fit[:2])
+    if at_edge:
         warnings.warn(
             f"Fitted ring radius {x[8].item():.1f} px is at the edge of fit_radii {fit_radii}. "
             "Choose fit_radii around the ring."
@@ -153,7 +184,8 @@ def fit_elliptical_distortion(
         "ellipse_params": ellipse,
         "center": (row_c + params[6].item(), col_c + params[7].item()),
         "fit_params": params,
-        "cost": (residuals(x) ** 2).sum().item(),
+        "cost": cost,
+        "at_edge": at_edge,
     }
 
 

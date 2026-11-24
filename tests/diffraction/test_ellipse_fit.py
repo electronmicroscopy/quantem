@@ -126,6 +126,23 @@ class TestFitEllipticalDistortion:
         angle_err = abs(theta_fit - theta_true)
         angle_err = min(angle_err, 180.0 - angle_err)  # handle wrapping
         assert angle_err < 5.0, f"theta: got {theta_fit:.1f}, expected {theta_true}"
+        assert not result["at_edge"]
+
+    def test_multi_seed_recovers_fit_stuck_at_edge(self):
+        """A bright beam tail pins the default fit at r_in; multi_seed finds the ring."""
+        a_true, b_true = 36.0, 32.0
+        ds = _make_synthetic_dataset(a=a_true, b=b_true, I1=50.0, sigma1=4.0, sigma2=6.0)
+        kwargs = dict(center=(128.0, 128.0), fit_radii=(20.0, 50.0))
+        with pytest.warns(UserWarning, match="edge of fit_radii"):
+            default = fit_elliptical_distortion(ds, **kwargs)
+        assert default["at_edge"]
+        result = fit_elliptical_distortion(ds, multi_seed=True, **kwargs)
+        assert not result["at_edge"]
+        a_fit, b_fit, _ = result["ellipse_params"]
+        assert abs(a_fit - a_true) / a_true < 0.02, f"a: got {a_fit:.2f}, expected {a_true}"
+        assert abs(b_fit - b_true) / b_true < 0.02, f"b: got {b_fit:.2f}, expected {b_true}"
+        with pytest.raises(ValueError, match="multi_seed"):
+            fit_elliptical_distortion(ds, p0=torch.ones(11), multi_seed=True, **kwargs)
 
     def test_recover_circular(self):
         """For a circular pattern (a==b), fitted a and b should be similar."""
