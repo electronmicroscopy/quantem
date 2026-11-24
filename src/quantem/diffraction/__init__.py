@@ -8,6 +8,7 @@ from quantem.diffraction.reverse_monte_carlo import ReverseMonteCarlo as Reverse
 from quantem.diffraction.strain import StrainMap as StrainMap
 from quantem.diffraction.strain_autocorrelation import StrainMapAutocorrelation as StrainMapAutocorrelation
 from quantem.diffraction.model_fitting import ModelDiffraction as ModelDiffraction
+from quantem.diffraction.systematic_row import SystematicRowMap as SystematicRowMap
 from quantem.diffraction import bloch as bloch
 from quantem.diffraction import calibration as calibration
 from quantem.diffraction import crystal_rotations as crystal_rotations

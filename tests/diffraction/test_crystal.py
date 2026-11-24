@@ -151,6 +151,8 @@ def test_wedge_is_fundamental_domain(label, spacegroup, symbols, basis, cellpar,
     atoms = ase_crystal(symbols, basis=basis, spacegroup=spacegroup, cellpar=cellpar)
     xtl = Crystal.from_ase(atoms, name=label, verbose=False)
     assert xtl.laue_group_matching == laue
+    # no ase objects inside Crystal, and the caller's structure keeps its own
+    assert "spacegroup" not in xtl.atoms.info and "spacegroup" in atoms.info
     # exactly one symmetry image of every direction lies in the wedge: the
     # wedge covers all of orientation space once (the -3m1 setting used to
     # get a wedge rotated by 30 degrees, covering half the directions twice)
@@ -392,6 +394,7 @@ def test_from_cif_keeps_partial_occupancy(tmp_path):
     assert content["Li"] == pytest.approx(8.444, abs=1e-6)
     assert content["O"] == pytest.approx(12.0, abs=1e-6)
     assert xtl.spacegroup.startswith("C2/m")
+    assert "spacegroup" not in xtl.atoms.info  # no ase objects inside Crystal
 
 
 def test_pseudo_symmetry_names_the_breaking_reflection(tmp_path):
