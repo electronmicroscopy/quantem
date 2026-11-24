@@ -7,8 +7,9 @@ which template matching handles poorly. The network, trained on simulated
 patterns, maps each pattern (resized to 256 x 256) to a peak-position map and a
 peak-intensity map; peaks are the local maxima of the smoothed position map.
 
-Everything after detection is shared with :class:`BraggVectors`: origins
-(:meth:`measure_origins`), calibration (:class:`DiffractionCalibration`), plots
+Origins come from :meth:`find_origins`, which finds each pattern's center of
+inversion symmetry. Everything after detection is shared with
+:class:`BraggVectors`: calibration (:class:`DiffractionCalibration`), plots
 and saving. :meth:`calibrate_amorphous_ring` measures the elliptic distortion
 from the amorphous ring, and :meth:`polar_peaks` returns the calibrated peaks as
 (q, theta, intensity) for the orientation and ice analyses.
@@ -36,6 +37,7 @@ from quantem.diffraction.disk_detection import (
     _split_by_counts,
 )
 from quantem.diffraction.ellipticity import fit_elliptical_distortion
+from quantem.diffraction.polar_transform import find_origin_angular_descent
 
 MODEL_SHAPE = (256, 256)
 _INVERSE_ANGSTROM = {"a^-1", "1/a", "a-1", "1/angstrom", "angstrom^-1"}
@@ -255,6 +257,48 @@ class BraggPeaksPolymer(BraggVectors):
         if returnfig:
             return fig, ax
 
+    def find_origins(
+        self,
+        radial_min: float = 4.0,
+        radial_max: float | None = None,
+        n_phi: int = 120,
+    ) -> np.ndarray:
+        """Origin of every pattern, from its inversion symmetry.
+
+        Each pattern's center is found by
+        :func:`~quantem.diffraction.polar_transform.find_origin_angular_descent`,
+        which minimizes the intensity variance around rings centred on it. It
+        uses the whole pattern, so it holds where the direct beam is weak or
+        saturated, and gives each pattern its own origin with no plane fit over
+        the scan. :meth:`measure_origins` (brightest peak near the center, then a
+        plane fit) remains available.
+
+        Parameters
+        ----------
+        radial_min, radial_max : float
+            Inner and outer radius, in detector pixels, of the rings scored.
+            ``radial_max=None`` reaches the detector edge.
+        n_phi : int, default=120
+            Angular samples per ring.
+
+        Returns
+        -------
+        np.ndarray
+            ``(scan_row, scan_col, 2)`` origins in detector pixels, also stored
+            on :attr:`origins`.
+        """
+        self.origins = np.asarray(
+            find_origin_angular_descent(
+                self.dataset,
+                radial_min=radial_min,
+                radial_max=radial_max,
+                n_phi=n_phi,
+                device=str(self.device),
+            ),
+            dtype=float,
+        )
+        return self.origins
+
     def calibrate_amorphous_ring(
         self,
         fit_radii: tuple[float, float],
@@ -283,7 +327,7 @@ class BraggPeaksPolymer(BraggVectors):
             should hold the amorphous ring and exclude the central beam.
         origins : np.ndarray, optional
             ``(scan_row, scan_col, 2)`` beam positions; defaults to
-            :attr:`origins`, else :meth:`measure_origins`. Stored on :attr:`origins`.
+            :attr:`origins`, else :meth:`find_origins`. Stored on :attr:`origins`.
         n_harmonics : int, default=2
             Angular harmonics of the ring amplitude.
         pixel_size : float, optional
@@ -322,7 +366,7 @@ class BraggPeaksPolymer(BraggVectors):
         if origins is not None:
             self.origins = np.asarray(origins, dtype=float)
         elif self.origins is None:
-            self.origins = self.measure_origins()
+            self.origins = self.find_origins()
         mean_dp, center = self._centered_mean(self.origins)
         fit = fit_elliptical_distortion(
             Dataset2d.from_array(mean_dp),
@@ -373,7 +417,7 @@ class BraggPeaksPolymer(BraggVectors):
         if self.peaks is None:
             raise RuntimeError("Run find_peaks_model() first.")
         if self.origins is None:
-            self.origins = self.measure_origins()
+            self.origins = self.find_origins()
         if calibration is None:
             calibration = self.calibration
         if calibration is None:

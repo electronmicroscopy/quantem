@@ -74,7 +74,8 @@ def test_calibrate_amorphous_ring_and_polar_peaks():
             [np.sin(a := rng.uniform(0, 2 * np.pi, 3)), np.cos(a)], 1
         )
         spots = origin + u @ np.linalg.inv(correction).T
-        cells.append(np.vstack([[*origin, 50.0], np.column_stack([spots, np.ones(3)])]))
+        beam = [*(origin + 1.0), 50.0]
+        cells.append(np.vstack([beam, np.column_stack([spots, np.ones(3)])]))
         g = u @ q_to_r_matrix(rotation, False).T
         expected.append(
             np.column_stack([np.hypot(*g.T) * pixel_size, np.mod(np.arctan2(*g.T), 2 * np.pi)])
@@ -91,6 +92,9 @@ def test_calibrate_amorphous_ring_and_polar_peaks():
     )
 
     bp.calibrate_amorphous_ring(fit_radii=(25, 52))
+    true_origins = np.array([[64.3 + 0.7 * r, 63.6 - 0.5 * c] for r, c in np.ndindex(scan)])
+    origin_error = np.abs(bp.origins.reshape(-1, 2) - true_origins).max()
+    assert origin_error < 0.1, origin_error
     polar = bp.polar_peaks().numpy().astype(float)
     counts = np.asarray(bp.peaks.row_counts())
     found = np.delete(polar, np.cumsum(np.r_[0, counts[:-1]]), axis=0)  # drop the central beams
