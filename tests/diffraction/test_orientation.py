@@ -478,7 +478,10 @@ def test_in_plane_angle_auto_fold():
     assert np.all(delta < 1.0), delta
     # explicit values and None still behave as before
     assert om.in_plane_angle_deg(mod_deg=90.0).max() <= 90.0
-    assert om.in_plane_angle_deg(mod_deg=None).max() > 60.0
+    # None returns the full angle in (-180, 180], which "auto" folds by 60
+    unfolded = om.in_plane_angle_deg(mod_deg=None).numpy()
+    assert unfolded.min() > -180.0 and unfolded.max() <= 180.0, unfolded
+    assert np.allclose(unfolded % 60.0, folded, atol=1e-6), unfolded
     # the angle turns with a right-handed rotation about the beam, from the
     # row axis toward the column axis, as quat_from_zone_axis(in_plane_deg)
     step = np.diff(folded[0]) % 60.0
