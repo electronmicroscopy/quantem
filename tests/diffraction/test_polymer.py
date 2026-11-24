@@ -101,6 +101,9 @@ def test_calibrate_amorphous_ring_and_polar_peaks():
     d_theta = np.angle(np.exp(1j * (found[:, 1] - expected[:, 1])))
     assert np.abs(np.rad2deg(d_theta)).max() < 0.3
 
+    with pytest.raises(ValueError, match="edge of fit_radii"):
+        bp.calibrate_amorphous_ring(fit_radii=(8, 30))  # inside the ring, so the fit ends at 30
+
 
 def test_pixel_size_from_detector_units():
     wavelength = electron_wavelength_angstrom(300e3)

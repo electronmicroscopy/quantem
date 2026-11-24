@@ -263,6 +263,7 @@ class BraggPeaksPolymer(BraggVectors):
         pixel_size: float | None = None,
         energy: float | None = None,
         mask: np.ndarray | None = None,
+        multi_seed: bool = False,
     ) -> DiffractionCalibration:
         """Calibrate from the amorphous ring of the origin-aligned mean pattern.
 
@@ -290,11 +291,21 @@ class BraggPeaksPolymer(BraggVectors):
         mask : np.ndarray, optional
             Detector pixels to leave out of the fit (True = ignore), such as a
             beam stop.
+        multi_seed : bool, default=False
+            Also start the ring fit from radii across ``fit_radii`` (see
+            :func:`~quantem.diffraction.ellipticity.fit_elliptical_distortion`).
+            Try it if the fit ends at the edge of ``fit_radii``.
 
         Returns
         -------
         DiffractionCalibration
             Also stored on :attr:`calibration`.
+
+        Raises
+        ------
+        ValueError
+            If the fitted ring radius is at the edge of ``fit_radii``, which means
+            the fit failed.
         """
         if origins is not None:
             self.origins = np.asarray(origins, dtype=float)
@@ -308,7 +319,13 @@ class BraggPeaksPolymer(BraggVectors):
             mask=mask,
             n_harmonics=n_harmonics,
             write_metadata=False,
+            multi_seed=multi_seed,
         )
+        if fit["at_edge"]:
+            raise ValueError(
+                f"The ring fit ended at the edge of fit_radii {fit_radii}. Choose fit_radii "
+                "around a single ring, or pass multi_seed=True."
+            )
         rotation, transpose, _ = self._scan_rotation(None, None)
         self.calibration = DiffractionCalibration(
             self._pixel_size(pixel_size, energy),
