@@ -8,20 +8,22 @@ from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.utils.utils import electron_wavelength_angstrom
 from quantem.diffraction.lattices import (
+    cluster_patterns,
     gaussian_form_factor,
     make_images,
     polycrystal,
     probe_patterns,
+    random_clusters,
 )
 from quantem.diffraction.multislice import circular_window
-from quantem.diffraction.wk_scattering_factors import compute_WK_factor
-from quantem.diffraction.pvc import (
-    PairVectorCorrelation,
+from quantem.diffraction.padf import (
+    PairAngleDistributionFunction,
     _cluster_power_sphere,
     _solve_sphere,
     order_parameter,
     pair_vector_marks,
 )
+from quantem.diffraction.wk_scattering_factors import compute_WK_factor
 
 N_PX, PIXEL, SIGMA, BOND = 128, 0.2, 0.4, 2.5
 
@@ -42,10 +44,10 @@ def triangular():
     return intensity, info[0]["positions_ang"]
 
 
-def _pvc(intensity, origin):
+def _padf(intensity, origin):
     dq = 1 / (N_PX * PIXEL)
     ds = Dataset2d.from_array(intensity, sampling=(dq, dq), units=["A^-1", "A^-1"])
-    return PairVectorCorrelation(
+    return PairAngleDistributionFunction(
         ds,
         origin=origin,
         fq=lambda q: np.maximum(gaussian_form_factor(q, SIGMA), 1e-3),
@@ -107,13 +109,13 @@ def test_beam_correlation_and_patterson_of_lattice(triangular, recwarn):
     atom positions and peaks at the angles pair_vector_marks expects, and the
     Patterson peaks at the bond vector."""
     intensity, positions = triangular
-    pvc = _pvc(intensity, (N_PX // 2, N_PX // 2))
+    padf = _padf(intensity, (N_PX // 2, N_PX // 2))
     assert not any("n = 1 harmonic" in str(w.message) for w in recwarn), (
         "centered pattern should not warn"
     )
-    theta, T = pvc.correlation("beam", r_max=6.0)
-    M = pvc.model_correlation([np.c_[positions, np.zeros(len(positions))]])
-    i = int(np.argmin(np.abs(pvc.r - BOND)))
+    theta, T = padf.correlation("beam", r_max=6.0)
+    M = padf.model_correlation([np.c_[positions, np.zeros(len(positions))]])
+    i = int(np.argmin(np.abs(padf.r - BOND)))
     interior = slice(15, 166)
     assert np.corrcoef(T[i, i, interior], M[i, i, interior])[0, 1] > 0.98
     angles = [a for _, a in pair_vector_marks(positions, BOND, 3.0, model="beam")]
@@ -122,7 +124,7 @@ def test_beam_correlation_and_patterson_of_lattice(triangular, recwarn):
         near = np.abs(theta - a) <= 20
         assert abs(theta[near][np.argmax(T[i, i, near])] - a) <= 2, f"peak near {a} deg"
 
-    image, px = pvc.patterson(r_max=4.0)
+    image, px = padf.patterson(r_max=4.0)
     c = image.shape[0] // 2
     rho = (
         np.hypot(
@@ -142,7 +144,7 @@ def test_miscentered_pattern_warns(triangular):
     """A pattern transformed about a point 2 px off its center has an n = 1 mean harmonic."""
     intensity, _ = triangular
     with pytest.warns(UserWarning, match="n = 1 harmonic"):
-        _pvc(intensity, (N_PX // 2 + 2, N_PX // 2))
+        _padf(intensity, (N_PX // 2 + 2, N_PX // 2))
 
 
 def test_probe_patterns_bright_field_and_kinematic_limit():
@@ -153,10 +155,10 @@ def test_probe_patterns_bright_field_and_kinematic_limit():
     scattering factors, each at its own depth on the Ewald sphere."""
     film = polycrystal(bulk("Si", "diamond", a=5.431, cubic=True), 8.0, 24.0, 8.0, seed=0)
     ds = probe_patterns(film, 4, 10.0, q_max=1.0)
-    pvc = PairVectorCorrelation(ds, energy=200e3)
+    padf = PairAngleDistributionFunction(ds, energy=200e3)
     expected = 10e-3 / electron_wavelength_angstrom(200e3)
     dq, n = ds.sampling[-1], ds.shape[-1]
-    assert abs(pvc.bright_field_radius - expected) < 0.5 * dq
+    assert abs(padf.bright_field_radius - expected) < 0.5 * dq
 
     kinematic = probe_patterns(film, 4, 10.0, q_max=1.0, kinematic=True).array
     q = np.hypot(*np.meshgrid(np.arange(n) - n // 2, np.arange(n) - n // 2, indexing="ij")) * dq
@@ -172,14 +174,18 @@ def test_probe_patterns_bright_field_and_kinematic_limit():
         positions=rng.random((30, 3)) * [width, width, thickness],
         cell=[width, width, thickness],
     )
-    pattern = probe_patterns(mixed, 1, 1e-3, energy=energy, q_max=2.0, slice_thickness=2.0, kinematic=True)
+    pattern = probe_patterns(
+        mixed, 1, 1e-3, energy=energy, q_max=2.0, slice_thickness=2.0, kinematic=True
+    )
     n = pattern.shape[-1]
     k = (np.arange(n) - n // 2) / width
     q = np.hypot(*np.meshgrid(k, k, indexing="ij"))
     amplitude = 0
     for pos, z in zip(mixed.positions, mixed.numbers):
         depth = 1j * np.pi * electron_wavelength_angstrom(energy) * pos[2] * k**2
-        amplitude = amplitude + compute_WK_factor(q.ravel(), int(z), energy).reshape(q.shape) * np.outer(
+        amplitude = amplitude + compute_WK_factor(q.ravel(), int(z), energy).reshape(
+            q.shape
+        ) * np.outer(
             np.exp(-2j * np.pi * pos[0] * k + depth), np.exp(-2j * np.pi * pos[1] * k + depth)
         )
     ring = (q > 0.05) & (q < 1.9)
@@ -198,7 +204,9 @@ def test_split_counts_removes_shot_noise_bias():
     )
     bias = [
         np.diagonal(
-            PairVectorCorrelation(ds, k_min=4, k_max=20, split_counts=split).second_moment[1:],
+            PairAngleDistributionFunction(ds, k_min=4, k_max=20, split_counts=split).second_moment[
+                1:
+            ],
             axis1=1,
             axis2=2,
         ).real.mean()
@@ -253,20 +261,41 @@ def test_self_term_removal(triangular):
     positions (one projection has no 3D pair distribution), and its first
     neighbor shell holds the bond length and stops short of the next shell."""
     intensity, positions = triangular
-    pvc = _pvc(intensity, (N_PX // 2, N_PX // 2))
+    padf = _padf(intensity, (N_PX // 2, N_PX // 2))
     with pytest.raises(ValueError, match="more than one pattern"):
-        pvc.correlation("sphere", part="fluctuation")
+        padf.correlation("sphere", part="fluctuation")
     for model in ("beam", "sphere"):
-        _, T = pvc.correlation(model, r_max=4.0)
-        i = int(np.argmin(np.abs(pvc.r - BOND)))
-        spike = [abs(V[i, i, 0]) / np.abs(V[i, i, 30:150]).max() for V in (T + pvc.Theta_self, T)]
+        _, T = padf.correlation(model, r_max=4.0)
+        i = int(np.argmin(np.abs(padf.r - BOND)))
+        spike = [abs(V[i, i, 0]) / np.abs(V[i, i, 30:150]).max() for V in (T + padf.Theta_self, T)]
         assert spike[0] > 0.9 and spike[1] < 0.4, (model, spike)
-        u, h = pvc.self_amplitude
+        u, h = padf.self_amplitude
         assert abs(u[np.argmax(h.sum(0))] - BOND) <= 0.1, model
         if model == "beam":
-            g2 = pvc.pair_distribution()
-            g2_model = pvc.model_pair_distribution([np.c_[positions, np.zeros(len(positions))]])
-            inside = pvc.r > 1.0
+            g2 = padf.pair_distribution()
+            g2_model = padf.model_pair_distribution([np.c_[positions, np.zeros(len(positions))]])
+            inside = padf.r > 1.0
             assert np.corrcoef(g2[inside], g2_model[inside])[0, 1] > 0.98
-            lo, hi = pvc.neighbor_shell(g2=g2)
+            lo, hi = padf.neighbor_shell(g2=g2)
             assert lo < BOND < hi < 0.5 * (1 + np.sqrt(3)) * BOND, (lo, hi)
+
+
+def test_classic_method():
+    """The classic method of bcc Fe cluster patterns matches its model, processed
+    the same way, at r = r' = the first shell, with peaks at the bond angles."""
+    fe = bulk("Fe", "bcc", a=2.87, cubic=True) * (8, 8, 8)
+    ds = cluster_patterns(fe, 200, n_px=96, q_max=3.5, r_cluster=6.0, blur_px=0.0, seed=0)
+    padf = PairAngleDistributionFunction(
+        ds, fq=lambda q: compute_WK_factor(q, 26, 200e3).real, k_min=0.1
+    )
+    with pytest.raises(ValueError, match="sphere model only"):
+        padf.correlation("beam", method="classic")
+    theta, T = padf.correlation("sphere", method="classic", l_max=30, r_max=4.0)
+    assert padf.Theta_self is None
+    M = padf.model_correlation([pos for pos, _ in random_clusters(fe, 100, 6.0, seed=1)])
+    i = int(np.argmin(np.abs(padf.r - 2.485)))
+    interior = slice(15, 166)
+    assert np.corrcoef(T[i, i, interior], M[i, i, interior])[0, 1] > 0.9
+    for a in (70.5, 109.5):
+        near = np.abs(theta - a) <= 15
+        assert abs(theta[near][np.argmax(T[i, i, near])] - a) <= 3, f"peak near {a} deg"

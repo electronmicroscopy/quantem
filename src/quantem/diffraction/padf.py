@@ -1,728 +1,1363 @@
+"""
+Pair angle distribution function (PADF) of diffraction patterns.
+
+A diffraction pattern samples the 3D intensity I(q) of the illuminated volume,
+the Fourier transform of its pair-vector distribution (the Patterson function),
+on the Ewald sphere. The PADF is the correlation of pairs of these pair vectors,
+by their lengths r and r' and the angle between them. We measure the mean and
+the second moment of the circular harmonics of many patterns,
+
+    M_n(k)     = < I_n(k) >
+    S_n(k, k') = < conj(I_n(k)) I_n(k') >,
+
+where I_n(k) is the coefficient of exp(i n phi) on the detector ring of radius k,
+and maps them to real-space pair-vector distributions and correlations with one
+of three rotation models:
+
+    "sphere"  every 3D orientation is equally likely (liquids, amorphous solids,
+              randomly oriented nanocrystals): the 3D PADF Theta(r, r', theta).
+    "beam"    the sample only rotates about the beam (2D materials, fiber texture
+              along the beam): the correlation of the projected pair vectors,
+              Theta(r, r', dphi), over 0 to 360 deg.
+    "none"    a single orientation: the mean pattern gives the directional
+              Patterson function of the projection.
+
+Every second moment splits into the part carried by the mean pattern,
+conj(M_n(k)) M_n(k'), which is order shared by all patterns, and the fluctuations
+about it. Anything identical in every pattern (the bright-field disk and its
+pixelation, ellipticity or miscentering, a static detector pattern) sits in the
+mean part, so the fluctuation part removes it exactly. For randomly oriented
+samples the mean pattern is isotropic and both parts carry the same structure,
+which is why the sphere model uses the fluctuation part by default. The
+moments add over patterns and every solve is linear, so averaging the outputs
+of subsets of patterns equals solving their summed moments.
+
+Every pair vector also correlates with itself and with its reverse, a spike at
+theta = 0 and 180 deg on r = r' whose size follows the pair distribution. It
+adds the same radial function to every order, times 2l + 1 (sphere) or 1 and
+(-1)^n (beam), so it is fitted and removed from Theta, which leaves the
+correlation of distinct pair vectors. The fitted term is kept in Theta_self,
+with its l = 0 part, which the solve cannot measure, restored, and
+plot_correlation can add it back. The mean pattern holds the same two-body
+information (pair_distribution). A Gaussian damping of the radial weight keeps
+the ringing of sharp features below 1%.
+
+order_parameter measures the crystalline ordering from the data alone: how
+much of the angular variance of Theta comes from distinct pair vectors rather
+than from the self term, over distance. Omega is near 1 for ordered regions as
+large as the illuminated volume and near 0.2 for a liquid. Its noise bias and confidence
+interval come from independent groups of patterns.
+
+The radial detector coordinate is |q| (1/A, no 2 pi). On the Ewald sphere the
+scattering vector makes the polar angle beta = 90 deg + asin(lambda |q| / 2)
+with the beam. With the spherical harmonic coefficients I_lm(q) of the 3D
+intensity, a sample in orientation R gives
+
+    I_n(k) = sum_l Y_ln(beta(k), 0) sum_m D^l_nm(R) I_lm(|q|),
+
+so for the sphere model, exactly,
+
+    S_n(k, k') = sum_l 4 pi / (2l + 1) Y_ln(beta, 0) Y_ln(beta', 0) B_l(q, q'),
+
+with B_l the rotational invariants of the 3D intensity. Summed over n, this is
+the angular correlation of the two rings, C(psi) = sum_l B_l P_l(cos gamma),
+with gamma the angle between the two scattering vectors. For each radius pair,
+B_l is fitted to C(psi) with the solid-angle weight d(cos gamma), in which the
+P_l are orthogonal, and an l = 0 term takes the uncorrelated background. Every
+harmonic n also holds all orders l >= n, which run to about 2 pi q times the
+cluster diameter, far above l_max; with this weight they do not fold into the
+fitted orders. The output is a density per unit volume squared and per unit
+cos(theta), so it carries no |sin(theta)| factor.
+
+correlation(method="classic") instead follows the original PADF algorithm
+(Martin, IUCrJ 4, 24 (2017); pypadf), as rewritten in quantem by K. Ehrhardt:
+the angular correlation of the rings on a flat Ewald sphere, minus its median
+over angle, is inverted for the even orders l <= l_max by a truncated SVD with
+a sin(theta) weight, transformed to real space without damping, and summed
+over orders times |sin(theta)|. It has no self-term removal and is kept for
+comparison; the solid-angle fit is the default.
+"""
+
+import warnings
+from typing import NamedTuple
+
 import matplotlib.pyplot as plt
-import torch
 import numpy as np
-from numpy.typing import NDArray
-from scipy.special import spherical_jn
+import torch
+from matplotlib.patches import Circle
+from matplotlib.transforms import ScaledTranslation
+from scipy.special import jv, spherical_jn, stdtrit
 
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.datastructures.polar4dstem import Polar4dstem
-from quantem.core.io.serialize import AutoSerialize
+from quantem.core.utils.utils import electron_wavelength_angstrom
 from quantem.diffraction.polar_transform import (
     as_dataset4dstem,
     find_origin_angular_grid,
     polar_transform,
 )
 
-class PairAngleDistributionFunction(AutoSerialize):
+
+class PairAngleDistributionFunction:
     """
-    Compute the pair-angle distribution function from diffraction data:
-    a single 2D pattern (Dataset2d), a 3D stack of patterns, or a 4D-STEM
-    dataset. Non-4D inputs are wrapped as (1, 1, H, W) / (N, 1, H, W).
+    Pair angle distribution function (PADF) from many diffraction patterns.
 
-    Run the following pipeline:
-    padf = PairAngleDistributionFunction(ds)
-    1. find_origin_angular_grid(ds)
-    2. polar_transform(ds, origin_array=self.origin)
-    3. rescale_intensity(self.polar, rho=1, fq=1)
-    4. compute_avg_angular_correlation(rescaled intensity)
-    5. subtract_angular_median(self.ang_corr)
-    6. extract_Bl_matrices(self.ang_corr_corrected)
-    7. transform_to_real_space(self.Bl_mats[0], self.Bl_mats[1])
-    8. reconstruct_PADF(self.real_Bl_mats, self.Bl_mats[1], Na=1); the overall scale is arbitrary
+    Parameters
+    ----------
+    data : Dataset4dstem, Polar4dstem, or a list / generator of them
+        Diffraction patterns. 2D patterns and 3D stacks are wrapped as 4D-STEM
+        data. A list or generator is accumulated one item at a time, for more
+        patterns than fit in memory; all items need the same radial axis.
+    energy : float or None
+        Beam energy (eV), which sets the Ewald sphere curvature. None treats the
+        Ewald sphere as flat.
+    origin : (row, col) or None
+        Pixel of q = 0. By default it is read from the dataset calibration, or
+        found with find_origin_angular_grid when the calibration has no offset.
+    ellipse_params : (a, b, theta_deg) or None
+        Elliptical distortion, corrected in the polar transform.
+    n_phi : int
+        Angular bins of the polar transform; harmonics up to n_phi // 2 - 1 are
+        kept. The transform samples n_phi points on each ring, so too few bins
+        skip pixels at large radii and waste counts; 360 bins use most pixels
+        of a 256-pixel pattern.
+    fq : callable, array or None
+        Mean atomic scattering factor f(q), or a function of |q| (1/A). Patterns
+        are divided by f(q)^2.
+    k_min, k_max : float or None
+        Radial range (1/A). By default k_min is two radial bins outside the
+        bright-field disk, whose radius is measured from the mean pattern
+        (bright_field_radius), and k_max is the largest radius.
+    taper : (float, float)
+        Widths (1/A) of the cosine ramps of the radial window at k_min and k_max.
+        The window applies in the real-space transforms only; each radius pair is
+        solved on its own, so the window never mixes radii.
+    damping : float or None
+        Width of a Gaussian damping exp(-(q / (damping k_max))^2) of the radial
+        weight, as a fraction of k_max, which keeps sidelobes below 1% for a
+        resolution in r of about 0.5 / (damping k_max). None turns it off.
+    batch_size : int
+        Patterns per chunk when accumulating the moments.
+    split_counts : bool
+        The patterns are electron counts: split the electrons of each pattern
+        at random into two halves, whose shot noise is independent, and
+        estimate the second moment from their cross products. This removes the
+        shot-noise bias of the second moment exactly.
+    seed : int
+        Random seed for split_counts.
 
-    polar_ds can instead be a polar dataset, or a list of them with the same
-    q axis, in which case steps 1-2 are skipped and the angular correlation is
-    averaged over the list (useful for more patterns than fit in memory).
-    fq may be a function of q (1/A), evaluated on the polar q axis self.q.
-    The real-space grid r = r_min, r_min + r_step, ... includes r_max.
+    The moments are normalized by the mean intensity where the radial window is 1.
+    Inside the bright-field disk the scattered wave interferes with the
+    unscattered beam, so a k_min inside the disk warns. A mean pattern with a
+    strong n = 1 harmonic near k_min warns: kinematic patterns are
+    centrosymmetric, so it points to a miscentered pattern or a bright-field
+    disk edge leaking into the window.
     """
-    def __init__(self,
-                 ds=None,
-                 origin: NDArray | None = None,
-                 polar_ds: Polar4dstem | list[Polar4dstem] | None = None,
-                 ang_corr: torch.Tensor | None = None,
-                 Bl_mats = None,
-                 rho: float = 1.0,
-                 fq=None,
-                 l_max: int = 40,
-                 r_min: float = 0.0,
-                 r_max: float = 20.0,
-                 r_step: float = 0.02,
-                 l_taper: bool = False,
-                 ):
-        super().__init__()
 
-        # accept a single 2D pattern, a 3D stack, or a 4D-STEM dataset
-        self.ds = as_dataset4dstem(ds) if ds is not None else None
-        if polar_ds is None:
-            self.origin = origin if origin is not None else find_origin_angular_grid(self.ds)
-            polar_ds = polar_transform(self.ds, origin_array=self.origin)
-        else:
-            self.origin = origin
-        polars = list(polar_ds) if isinstance(polar_ds, (list, tuple)) else [polar_ds]
-        self.polar = polars[0]
-        # radial q calibration of the polar dataset: bin i sits at q_min + i * dq
-        dq = float(np.asarray(self.polar.sampling)[3])
-        q_min = float(np.asarray(self.polar.origin)[3])
-        self.q = q_min + np.arange(self.polar.shape[-1]) * dq
-        if callable(fq):
-            fq = fq(self.q)
-
-        # TODO: look up rho and fq from sample identity when not provided
-        if ang_corr is None:
-            ang_corr = sum(
-                self.compute_avg_angular_correlation(self.rescale_intensity(p, rho=rho, fq=fq)) for p in polars
-            ) / len(polars)
-        self.ang_corr = ang_corr
-        self.ang_corr_corrected = self.subtract_angular_median(self.ang_corr)
-        self.Bl_mats = Bl_mats if Bl_mats is not None else self.extract_Bl_matrices(self.ang_corr_corrected, l_max=l_max)
-        self.real_Bl_mats = self.transform_to_real_space(self.Bl_mats[0], self.Bl_mats[1], dq=dq, q_min=q_min,
-                                                         r_min=r_min, r_max=r_max + 0.5 * r_step, r_step=r_step)
-        self.padf = self.reconstruct_PADF(self.real_Bl_mats, self.Bl_mats[1], 1, l_taper=l_taper)
-    
-    @staticmethod
-    def rescale_intensity(data: Polar4dstem | Dataset4dstem | None = None,
-                          rho: float | int = 1.0,
-                          fq: NDArray | torch.Tensor | float | int | None = None):
-        """
-        Equation 7: Take the raw intensity and divide by the following factors
-        - Mean number density (rho)
-        - Mean atomic scattering factor squared (f(q)^2)
-        - Number of atoms in the beam (N_a)
-        - phi_0 (dependent on experimental parameters)
-
-        fq may be a scalar or a per-radial-bin array f(q) of length Nq
-        (broadcast along the last axis of the polar data). Dividing by
-        f(q)^2 removes the atom-shape damping of the diffraction rings;
-        leaving it in biases the real-space peak positions of the PADF.
-        Floor small f(q) values before passing to avoid amplifying the
-        high-q noise floor.
-
-        Finally the intensity is normalized to unit mean. This is the
-        analogue of pypadf's scalar 1/beamnorm^2 correlation scaling: it
-        absorbs the unmeasurable overall factors (phi_0, N_a, detector
-        gain) so the PADF magnitude is independent of the raw intensity
-        scale.
-
-        Handles dtype conversion to float64
-        """
-
-        intensity = data.tensor.to(dtype=torch.float64)
-        if fq is None:
-            fq2 = 1.0
-        elif np.ndim(fq) == 0:
-            fq2 = float(fq) ** 2
-        else:
-            fq_t = torch.as_tensor(np.asarray(fq), dtype=torch.float64)
-            if fq_t.shape[-1] != intensity.shape[-1]:
-                raise ValueError(
-                    f"fq has length {fq_t.shape[-1]} but the polar data has "
-                    f"{intensity.shape[-1]} radial bins."
-                )
-            fq2 = fq_t ** 2  # broadcasts along the radial (last) axis
-        rescaled_intensity = intensity / (rho * fq2)
-        rescaled_intensity /= rescaled_intensity.mean()
-        return rescaled_intensity
-    
-    @staticmethod
-    def compute_avg_angular_correlation(data):
-        """
-        Equation 8: angular cross correlation implemented via Fourier correlation theorem
-        """
-
-        scan_row, scan_col, phi, r = data.shape
-        g_all = data.reshape(scan_row * scan_col, phi, r) # Flatten grid of dps to one dimension, makes for loop simpler
-        N_alpha = g_all.shape[0] # Number of dps we have = number of configurations (N_alpha)
-
-        dphi = 2.0 * torch.pi / phi # A small change in angle
-
-        G = torch.fft.rfft(g_all, dim=1) # Fourier transform along phi axis
-        P = torch.einsum('afi,afj->fij', G.conj(), G) # Outer product of r between G and its conjugate, summed over all N_alpha
-        C_sum = torch.fft.irfft(P, n=phi, dim=0)
-
-        C_avg = (C_sum / N_alpha) * dphi
-        return C_avg
-
-    def subtract_angular_mean(self, C_avg: torch.Tensor):
-        """
-        Subtract the theta-average from each (q, q') ring of the angular
-        correlation, removing the uncorrelated background.
-
-        Matches the subtraction in pypadf's maskcorr.py. We do not apply their |sin(theta)| 
-        factor here because it changes the function being expanded and mixes Legendre orders 
-        before the order-dependent Bessel transforms. Instead, we sin-weight the Legendre 
-        fit in extract_Bl_matrices() to match the d(cos theta) measure of the Legendre 
-        polynomials.
-        """
-        return C_avg - C_avg.mean(dim=0, keepdim=True)
-
-    @staticmethod
-    def subtract_angular_median(C_avg: torch.Tensor):
-        """
-        Subtract the theta-median from each (q, q') ring of the angular
-        correlation. Unlike the mean, the median is not pulled up by the
-        self-correlation peak at theta = 0. The offset only changes B_0, so
-        the PADF (l >= 2) is the same as with subtract_angular_mean.
-        """
-        return C_avg - C_avg.median(dim=0, keepdim=True).values
-
-    def extract_Bl_matrices(self, C_avg, l_max=40, sv_cutoff=0.05, sin_weight=True,
-                            theta_exclude=0.0):
-        """
-        sin_weight : bool
-            Weight each angle in the least-squares fit by |sin(theta)|. C is
-            sampled evenly in theta, but Legendre polynomials are orthogonal in
-            cos(theta), and near 0 and 180 deg many samples crowd into a small
-            range of cos(theta). Since |sin(theta)| d(theta) = |d cos(theta)|,
-            this weight counts each sample by the cos(theta) range it covers.
-        theta_exclude : float
-            In degrees, correlation bins within theta_exclude of 0 and 360 deg get zero
-            weight in the fit. Use to exclude self correlations and keeps them out of B_l.
-        """
-        # Equation 9, 10, 11
-        # for each l:
-        #     build the linear system relating C to B_l(q, q')
-        #     solve it by SVD
-        # even l only: a single kinematic pattern is Friedel symmetric
-        # 5% SVD cutoff
-        Nphi, Nq, Nqp = C_avg.shape
-        dphi = torch.linspace(0, 2 * torch.pi, Nphi + 1, dtype=torch.float64)[:-1] # Ranges from [0, 2pi)
-        l_values = torch.arange(0, l_max, 2) # Even only
-        Nl = len(l_values)
-        cos_dphi = torch.cos(dphi)
-
-        C_flat = C_avg.reshape(Nphi, Nq * Nqp)
-
-        # Build matrix
-        L = l_values.reshape(1, Nl)
-        X = cos_dphi.reshape(Nphi, 1)
-        leg_matrix = torch.special.legendre_polynomial_p(X, L.to(torch.float64))  # (Nphi, Nl) by broadcasting
-
-        # per-angle fit weight: sqrt|sin| (sin_weight), zero within theta_exclude of 0/360 deg
-        w = torch.sqrt(torch.abs(torch.sin(dphi))) if sin_weight else torch.ones_like(dphi)
-        if theta_exclude > 0:
-            te = np.deg2rad(theta_exclude)
-            w[(dphi < te) | (dphi > 2 * torch.pi - te)] = 0
-        leg_matrix = leg_matrix * w[:, None]
-        C_flat = C_flat * w[:, None]
-
-        U, S, Vh = torch.linalg.svd(leg_matrix, full_matrices=False)
-        S_max = S.max()
-        S_inv = torch.where(S > sv_cutoff * S_max, 1.0 / S, torch.zeros_like(S))
-
-        tmp = U.T @ C_flat
-        tmp = S_inv.unsqueeze(1) * tmp
-        B_flat = Vh.T @ tmp
-
-        return B_flat.reshape(Nl, Nq, Nqp), l_values
-
-    def transform_to_real_space(self, Bl_mats, l_values, dq=0.01, q_min=0.0,
-                                r_min=0.0, r_max=20.0, r_step=0.02):
-        """
-        Transform B_l(q, q') to B_l(r, r') by applying the spherical Bessel
-        transform (eq 8) along each q axis via direct quadrature.
-
-        dq : radial q step of the polar dataset (e.g. angstrom^-1 / bin).
-        q_min : q value of the first radial bin (nonzero if the polar
-            transform used radial_min > 0).
-        r_min, r_max, r_step : real-space grid, in the reciprocal units of q.
-
-        The transform kernel is nondimensionalized by q_max (the quadrature
-        uses (q / q_max)^2 d(q / q_max) per axis), so the output B_l(r, r')
-        is dimensionless rather than carrying units of q^6. Combined with
-        the unit-mean intensity normalization in rescale_intensity, this
-        keeps PADF values of order 1.
-        """
-        # Equation 12, 13
-        # apply bessel transform twice for each l
-        # → shape = (l, r, r')
-
-        # Step one is to define q
-        q = q_min + torch.arange(0, Bl_mats.shape[1], dtype=torch.float64) * dq
-        q_max = float(q[-1])
-        r = torch.arange(r_min, r_max, r_step, dtype=torch.float64)
-        self.r = r.numpy()
-        real_Bl = torch.zeros((Bl_mats.shape[0], r.shape[0], r.shape[0]), dtype=torch.float64)
-
-        arg = 2 * torch.pi * torch.outer(r, q)  # Shape len(r) x len(q)
-        for l in range(len(l_values)):
-            Bl = Bl_mats[l].to(dtype=torch.float64) # The corresponding q x q' matrix
-            jl = torch.from_numpy(spherical_jn(l_values[l], arg)).to(dtype=torch.float64)
-
-            # Representing DSBT (eq 12) as a transformation matrix "sbessel",
-            # with q scaled by q_max so the quadrature is dimensionless
-            sbessel = 4 * torch.pi * jl * (q**2) * dq / q_max**3
-            # Applying it twice (once along each axis)
-            real_Bl[l] = sbessel @ Bl @ sbessel.T * (-1)**l_values[l]
-        
-        return real_Bl
-
-    def reconstruct_PADF(self, real_Bl, l_values, Na, per_theta=True, l_taper=False):
-        """
-        Reconstruct the pair-angle distribution function from B_l(r, r')
-        For each theta:
-        - Sum Pl(cos theta) times B_l() over all l
-        - Multiply by n_alpha * 2 pi
-
-        Theta goes from 0 to pi in 180 steps. Na scales the result; with the
-        unit-mean intensity normalization the overall scale is arbitrary.
-
-        per_theta : bool
-            The Legendre sum is the real-space correlation C(r, r', cos theta)
-            (pypadf paper eq. 10). If True, multiply by |sin theta| to return a
-            quantity proportional to Theta(r, r', theta) (pypadf paper eq. 11).
-        l_taper : bool
-            Weight each order by order_taper(l, l_max), which suppresses the
-            ringing in theta from truncating the Legendre sum at l_max.
-        """
-        padf = torch.zeros((real_Bl.shape[1], real_Bl.shape[2], 180), dtype=torch.float64)
-        l_values = np.asarray(l_values).astype(int)
-        weights = order_taper(l_values, l_values[-1] + 2) if l_taper else np.ones(len(l_values))
-        theta = np.linspace(0, np.pi, 180)
-        self.theta = theta
-        self.theta_deg = np.degrees(theta)
-        cos_theta = torch.cos(torch.as_tensor(theta, dtype=torch.float64))
-        chosen_l_values = l_values[1:]
-
-        # Sum over all l
-        for l in range(len(chosen_l_values)): # skipping l = 0
-            Pl = torch.special.legendre_polynomial_p(cos_theta, int(chosen_l_values[l]))
-            Bl = real_Bl[l + 1] * weights[l + 1] # skipping l = 0
-            padf += Bl[:, :, np.newaxis] * Pl[np.newaxis, np.newaxis, :]
-
-        padf *= 2 * torch.pi * Na
-        if per_theta:
-            padf *= torch.as_tensor(np.abs(np.sin(theta)), dtype=torch.float64)
-        return padf
-
-    def plot_g2_g3(
+    def __init__(
         self,
-        r_min: float | None = None,
-        r_max: float | None = None,
-        r_display_power: int = 1,
-        r_max_display: float | None = None,
-        r_search_min: float = 0.5,
-        r_marks=None,
-        markers=None,
-        title: str | None = None,
-        figsize: tuple[float, float] = (4.8, 4.4),
-        returnfig: bool = False,
+        data,
+        energy: float | None = None,
+        origin=None,
+        ellipse_params=None,
+        n_phi: int = 360,
+        fq=None,
+        k_min: float | None = None,
+        k_max: float | None = None,
+        taper: tuple[float, float] = (0.1, 0.25),
+        damping: float | None = 0.6,
+        batch_size: int = 512,
+        split_counts: bool = False,
+        seed: int = 0,
+    ):
+        self.energy = energy
+        self.wavelength = electron_wavelength_angstrom(energy) if energy else 0.0
+        items = list(data) if isinstance(data, (list, tuple)) else data
+        if isinstance(data, (Dataset4dstem, Polar4dstem)) or hasattr(data, "array"):
+            items = [data]
+
+        gen = torch.Generator().manual_seed(seed)
+        sum_M = sum_S = None
+        self.n_patterns = 0
+        for item in items:
+            if split_counts:
+                *halves, item_origin = _split_counts(item, origin, gen)
+            else:
+                halves, item_origin = [item], origin
+            polars = [self._to_polar(h, item_origin, ellipse_params, n_phi) for h in halves]
+            if sum_M is None:
+                self._set_geometry(polars[0], fq)
+            elif polars[0].shape[-1] != self.q.size:
+                raise ValueError("all datasets need the same radial axis")
+            stacks = [
+                p.tensor.reshape(-1, p.shape[-2], p.shape[-1]).to(torch.float64) for p in polars
+            ]
+            for start in range(0, stacks[0].shape[0], batch_size):
+                F = [self._harmonics(x[start : start + batch_size]) for x in stacks]
+                if split_counts:  # each half carries half the intensity and independent noise
+                    M = (F[0] + F[1]).sum(dim=0)
+                    S = 2 * torch.einsum("bnk,bnj->nkj", F[0].conj(), F[1])
+                    S = S + S.conj().transpose(1, 2)
+                else:
+                    M = F[0].sum(dim=0)
+                    S = torch.einsum("bnk,bnj->nkj", F[0].conj(), F[0])
+                sum_M = M if sum_M is None else sum_M + M
+                sum_S = S if sum_S is None else sum_S + S
+                self.n_patterns += F[0].shape[0]
+
+        M = sum_M / self.n_patterns
+        S = sum_S / self.n_patterns
+        self.mean_intensity = (M[0].real * self._f2).numpy()  # azimuthal mean of the patterns
+        self.bright_field_radius = _bright_field_radius(self.q, self.mean_intensity)
+        if k_min is None:
+            k_min = self.bright_field_radius + 2 * (self.q[1] - self.q[0])
+        elif k_min < self.bright_field_radius:
+            warnings.warn(
+                f"k_min = {k_min:.3f} 1/A is inside the bright-field disk "
+                f"(radius {self.bright_field_radius:.3f} 1/A), where the scattered wave "
+                "interferes with the unscattered beam."
+            )
+        self.k_min, self.k_max = k_min, self.q[-1] if k_max is None else k_max
+        self.window = _radial_window(self.q, self.k_min, self.k_max, taper)
+        self.damping = damping
+        self.weight = self.window * (
+            np.exp(-((self.q / (damping * self.k_max)) ** 2)) if damping else 1.0
+        )  # radial weight of the real-space transforms
+        scale = float(
+            M[0].real[self.window == 1].mean()
+        )  # flat part of the window, clear of the bright-field edge
+        self.mean_harmonics = (M / scale).numpy()  # (n, k)
+        self.second_moment = (S / scale**2).numpy()  # (n, k, k')
+        self._check_centering()
+
+    # ------------------------------------------------------------------ moments
+
+    @staticmethod
+    def _to_polar(item, origin, ellipse_params, n_phi):
+        if isinstance(item, Polar4dstem):
+            return item
+        ds = as_dataset4dstem(item)
+        return polar_transform(
+            ds,
+            origin_array=_pattern_origin(ds, origin),
+            ellipse_params=ellipse_params,
+            num_annular_bins=n_phi,
+        )
+
+    def _set_geometry(self, polar, fq):
+        n_q = polar.shape[-1]
+        self.n_phi = polar.shape[-2]
+        self.n_max = self.n_phi // 2 - 1
+        self.q = float(np.asarray(polar.origin)[3]) + np.arange(n_q) * float(
+            np.asarray(polar.sampling)[3]
+        )
+        half_angle = np.arcsin(np.clip(self.wavelength * self.q / 2, 0, 1))
+        self.beta = np.pi / 2 + half_angle  # polar angle of q from the beam axis
+        self.q_perp = self.q * np.cos(half_angle)  # component of q perpendicular to the beam
+        self.dq = np.gradient(self.q)
+        self.dq_perp = np.gradient(self.q_perp)
+        fq = fq(self.q) if callable(fq) else fq
+        f2 = (
+            np.ones(n_q)
+            if fq is None
+            else np.broadcast_to(np.asarray(fq, dtype=np.float64), (n_q,)) ** 2
+        )
+        self._f2 = torch.from_numpy(np.ascontiguousarray(f2))
+
+    def _harmonics(self, patterns):
+        """Circular harmonics (B, n_max + 1, Nk) of a stack of polar patterns (B, n_phi, Nk)."""
+        F = torch.fft.rfft(patterns / self._f2[None, None, :], dim=1) / self.n_phi
+        return F[:, : self.n_max + 1, :]
+
+    def _check_centering(self, threshold: float = 0.05):
+        """Warn when the mean pattern has an n = 1 harmonic near k_min larger than
+        threshold times the mean intensity in the window (the moments are normalized
+        so that this mean is 1)."""
+        band = (
+            (self.window > 0) & (self.window < 1) & (self.q < self.q[self.window > 0].min() + 0.5)
+        )
+        if not band.any():
+            return
+        self.n1_near_k_min = float(np.abs(self.mean_harmonics[1, band]).max())
+        if self.n1_near_k_min > threshold:
+            warnings.warn(
+                f"The mean pattern has an n = 1 harmonic of {self.n1_near_k_min:.0%} of the mean intensity near k_min. "
+                "Kinematic patterns are centrosymmetric, so check the origin and ellipticity, "
+                "or raise k_min so the bright-field disk edge stays out of the window."
+            )
+
+    def _part(self, part: str):
+        M = self.mean_harmonics
+        mean = np.conj(M)[:, :, None] * M[:, None, :]
+        if part == "total":
+            return self.second_moment
+        if part == "mean":
+            return mean
+        if part == "fluctuation":
+            if self.n_patterns == 1:
+                raise ValueError(
+                    "the fluctuation part needs more than one pattern; for a single pattern "
+                    "it is zero apart from rounding, so use part='total'"
+                )
+            return self.second_moment - mean
+        raise ValueError(f"part must be 'total', 'mean' or 'fluctuation', got {part!r}")
+
+    def mean_fraction(self) -> float:
+        """
+        Share of the second moment (harmonics n >= 1, radii in the window)
+        carried by the mean pattern: about 0 for liquids, amorphous solids and
+        randomly oriented domains, and 1 for a single orientation.
+        """
+        w = np.outer(self.window, self.window)[None]
+        mean = np.abs(self._part("mean")[1:]) * w
+        return float(mean.sum() / (np.abs(self.second_moment[1:]) * w).sum())
+
+    # ------------------------------------------------------------------ solvers
+
+    def correlation(
+        self,
+        model: str = "sphere",
+        method: str = "moments",
+        part: str | None = None,
+        l_max: int = 60,
+        n_max: int | None = None,
+        r_max: float = 8.0,
+        r_step: float = 0.05,
+        order_taper: bool = True,
+        sv_cutoff: float = 0.05,
     ):
         """
-        Stacked 2-body / 3-body correlation summary of the PADF, after
-        atomode's G3 explorer. The two panels share the radial axis.
+        PADF Theta(r, r', theta) in real space.
 
-        Top panel: 3-body correlation map - Theta(r, r', theta) integrated
-        over r in [r_min, r_max] (symmetrized over both radial axes),
-        plotted as angle theta vs r'.
+        model : "sphere" (3D, theta from 0 to 180 deg) or "beam" (projected,
+            dphi from 0 to 360 deg); see the module docstring.
+        method : "moments", the solid-angle fit of the second moments with the
+            self term removed; or "classic", the original PADF algorithm (see the
+            module docstring), for the sphere model only. The classic Theta holds
+            the self term and a |sin(theta)| factor, and Theta_self is None.
+        part : "total", "mean" or "fluctuation" second moment; by default
+            "fluctuation" for the sphere model and "total" for the beam model,
+            which is often applied to single patterns, for a single pattern,
+            whose fluctuation part is zero, and for the classic method.
+        l_max : largest (even) spherical harmonic order, for the sphere model.
+        n_max : largest circular harmonic order, for the beam model.
+        r_max, r_step : real-space grid (A), including r_max.
+        order_taper : weight the orders by a cos^2 taper to zero just past the
+            largest order, which suppresses ringing in theta.
+        sv_cutoff : for the classic method, singular values below this fraction
+            of the largest are left out of the inversion.
 
-        Bottom panel: 2-body correlation profile - the |sin(theta)|-weighted
-        RMS of the r = r' diagonal over the interior angular range
-        (15-165 deg),
-            sqrt( sum_theta Theta(r, r, theta)^2 sin(theta)
-                  / sum_theta sin(theta) ).
-        This stands in for the isotropic pair correlation (whose true l = 0
-        component is removed by the correlation mean subtraction; a plain
-        sin-weighted integral of Theta cancels to ~zero by Legendre
-        orthogonality). It peaks at the radial shells where the PADF has
-        angular structure and is used to choose the near-neighbor shell;
-        the integration shell [r_min, r_max] is shaded.
-
-        Both panels are weighted by r^(2 * r_display_power) for display, and
-        the map's color limits are taken from the interior angular range
-        (15-165 deg) so the collinear theta = 0 / 180 bands saturate rather
-        than compressing the color scale.
-
-        Parameters
-        ----------
-        r_min, r_max : float or None
-            Integration shell bounds in the r units of the PADF (Angstroms
-            for calibrated data). If None, the first peak of g2 is selected
-            automatically: from the last point below 5% of the peak height
-            up to the first local minimum past the peak (atomode's default
-            shell heuristic).
-        r_display_power : int
-            Display weighting exponent; each panel is multiplied by
-            r^(2 * r_display_power). 0 plots the raw values.
-        r_max_display : float or None
-            Upper limit of the radial axes; defaults to r.max().
-        r_search_min : float
-            Ignore r below this value when auto-locating the g2 peak
-            (excludes the r ~ 0 reconstruction artifacts).
-        r_marks : sequence of float or None
-            Radii (e.g. the 1st/2nd/3rd neighbor shell distances) marked
-            with dotted vertical lines on both panels.
-        markers : sequence of (r, theta_deg) or None
-            Expected 3-body maxima overlaid on the map as open circles -
-            e.g. the (shell distance, arm-arm angle) targets from a known
-            structure. A third element per tuple, if present, scales the
-            marker size (relative multiplicity).
-        title : str or None
-            Figure title; a shell summary is used if None.
-        returnfig : bool
-            Return (fig, (ax_g2, ax_g3)) instead of calling plt.show().
+        Returns theta_deg (Ntheta,) and Theta (Nr, Nr, Ntheta), the correlation
+        of distinct pair vectors; also stored on the object (r, theta_deg,
+        Theta, and the order coefficients G of the orders l_values or n_values)
+        with the settings for model_correlation. The self term, each pair
+        vector correlated with itself and its reverse, is stored in Theta_self
+        (orders G_self, and G0_self for l = 0 or n = 0), and its radial
+        amplitude, which follows the pair distribution, in self_amplitude as
+        (u, h).
         """
-        r = np.asarray(self.r)
-        theta = np.asarray(self.theta)  # radians
-        theta_deg = np.asarray(self.theta_deg)
-        arr = self.padf.numpy() if hasattr(self.padf, "numpy") else np.asarray(self.padf)
+        if method not in ("moments", "classic"):
+            raise ValueError(f"method must be 'moments' or 'classic', got {method!r}")
+        if method == "classic" and model != "sphere":
+            raise ValueError("the classic method is defined for the sphere model only")
+        if part is None:
+            moments_sphere = model == "sphere" and method == "moments"
+            part = "fluctuation" if moments_sphere and self.n_patterns > 1 else "total"
+        self.r = np.arange(0, r_max + 0.5 * r_step, r_step)
+        self.model, self.method, self.part, self.order_taper = model, method, part, order_taper
+        S = self._part(part)
+        if method == "classic":
+            self.l_values = np.arange(2, l_max + 1, 2)
+            self.B = _solve_classic(S.real, self.l_values, sv_cutoff, self.n_phi)
+            G = self._real_space_classic(self.B)
+            self.G, self.G_self, self.G0_self, self.self_amplitude = G.numpy(), None, None, None
+            self.theta_deg, self.Theta = self._angular_sum(G)
+            self.Theta_self = None
+            return self.theta_deg, self.Theta
+        if model == "sphere":
+            self.l_values = np.arange(2, l_max + 1, 2)
+            self.B = _solve_sphere(S.real, self.beta, self.l_values)
+            G = self._real_space_sphere(self.B)
+        elif model == "beam":
+            self.n_values = np.arange(1, (self.n_max if n_max is None else n_max) + 1)
+            G = self._real_space_beam(S[self.n_values])
+        else:
+            raise ValueError(f"model must be 'sphere' or 'beam', got {model!r}")
+        G_self, G0_self, u, h = self._self_term(G)
+        G = G - G_self
+        self.G, self.G_self, self.G0_self = G.numpy(), G_self.numpy(), G0_self.numpy()
+        self.self_amplitude = (u, h)
+        self.theta_deg, self.Theta = self._angular_sum(G)
+        self.Theta_self = self._angular_sum(G_self, self.G0_self)[1]
+        return self.theta_deg, self.Theta
 
-        # pair profile: sin(theta)-weighted RMS of the diagonal over the
-        # interior angles (a plain integral cancels by Legendre orthogonality
-        # since the l = 0 term is removed by the mean subtraction)
-        diag = np.einsum("iik->ik", arr)
-        interior_t = (theta_deg > 15) & (theta_deg < 165)
-        w_t = np.abs(np.sin(theta[interior_t]))
-        g2 = np.sqrt((diag[:, interior_t] ** 2 * w_t[None, :]).sum(axis=1) / w_t.sum())
+    def _angular_sum(self, G, G0=None):
+        """Theta from the order coefficients G and an optional order-0 part G0 (Nr, Nr)."""
+        if self.model == "sphere":
+            theta = np.arange(0, 181, 1.0)
+            out = _legendre_sum(G, self.l_values, theta, self.order_taper)
+            if self.method == "classic":  # per unit theta rather than per unit cos(theta)
+                out = out * np.abs(np.sin(np.deg2rad(theta)))[None, None, :]
+        else:
+            theta = np.arange(0, 361, 1.0)
+            out = _harmonic_sum(G, self.n_values, theta, self.order_taper)
+        return theta, out if G0 is None else out + G0[:, :, None]
 
-        # auto-select the first g2 peak if no shell was given
-        if r_min is None or r_max is None:
-            kernel = np.array([1.0, 2.0, 3.0, 2.0, 1.0])
-            kernel /= kernel.sum()
-            smooth = np.convolve(np.where(r < r_search_min, 0.0, g2), kernel, mode="same")
-            i_pk = None
-            for idx in range(1, smooth.size - 1):
-                if smooth[idx] > 0 and smooth[idx] >= smooth[idx - 1] and smooth[idx] > smooth[idx + 1]:
-                    i_pk = idx
-                    break
-            if i_pk is None:
-                i_pk = int(np.argmax(smooth))
-            below = np.flatnonzero(smooth[:i_pk] < 0.05 * smooth[i_pk])
-            i_lo = int(below[-1]) if below.size else int(np.searchsorted(r, r_search_min))
-            i_hi = min(smooth.size - 1, 2 * i_pk - i_lo)
-            for idx in range(i_pk + 1, smooth.size - 1):
-                if smooth[idx] <= smooth[idx - 1] and smooth[idx] <= smooth[idx + 1]:
-                    i_hi = idx
-                    break
-            if r_min is None:
-                r_min = float(r[i_lo])
-            if r_max is None:
-                r_max = float(r[i_hi])
+    def _length_image(self, order, u):
+        """(Nr, Nu) band-limited image in r of pair vectors of each length u, for one order."""
+        du = u[1] - u[0]
+        if self.model == "sphere":
+            Kr = spherical_jn(order, 2 * np.pi * np.outer(self.q, u)) * (u**2 * du)[None, :]
+            return self._kernel_sphere(order) @ torch.from_numpy(Kr)
+        Kr = jv(order, 2 * np.pi * np.outer(self.q_perp, u)) * (u * du)[None, :]
+        return self._kernel_beam(order) @ torch.from_numpy(Kr)
 
-        shell = (r >= r_min) & (r <= r_max)
-        if not np.any(shell):
-            shell[int(np.argmin(np.abs(r - 0.5 * (r_min + r_max))))] = True
+    def _self_term(self, G, band: float = 0.5, u_step: float = 0.1, ridge: float = 1e-2):
+        """
+        Fit the self term of the order coefficients G. A pair vector of length u
+        adds c_k A_k(r, u) A_k(r', u) to order k, with A_k the band-limited image
+        of the length u and c_k = 2l + 1 (sphere, where both directions add
+        alike) or 1 and (-1)^n (beam, one amplitude per direction). The
+        amplitudes h(u) are fitted to G where |r - r'| <= band (A), by least
+        squares with a ridge of `ridge` times the mean diagonal.
 
-        # g3 map: integrate over the shell, symmetrized over both r axes
-        g3_map = 0.5 * (arr[shell].sum(axis=0) + arr[:, shell].sum(axis=1))  # (Nr', Ntheta)
-
-        # display weighting and color limits
-        if r_max_display is None:
-            r_max_display = float(r[-1])
-        weight = r ** (2 * r_display_power)
-        g2_disp = g2 * weight
-        g3_disp = (g3_map * weight[:, None]).T  # (Ntheta, Nr')
-        rs = r <= r_max_display
-        interior = (theta_deg > 15) & (theta_deg < 165)
-        vmax = np.quantile(np.abs(g3_disp[np.ix_(interior, rs)]), 0.999)
-
-        fig, (ax_g3, ax_g2) = plt.subplots(
-            2, 1, sharex=True, figsize=figsize,
-            gridspec_kw={"height_ratios": [2, 1]},
-            constrained_layout=True,
+        Returns G_self (like G), its order-0 part G0_self (Nr, Nr), u (Nu,) and
+        h (directions, Nu).
+        """
+        u = np.arange(0.5 * u_step, self.r[-1] + 1.0, u_step)
+        ir, jr = (
+            torch.as_tensor(x)
+            for x in np.nonzero(np.abs(np.subtract.outer(self.r, self.r)) <= band)
         )
-        im = ax_g3.pcolormesh(
-            r[rs], theta_deg, g3_disp[:, rs],
-            cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="auto",
+        orders = self.l_values if self.model == "sphere" else self.n_values
+        signs = (
+            [2.0 * orders + 1]
+            if self.model == "sphere"
+            else [np.ones(orders.size), (-1.0) ** orders]
         )
-        ax_g3.set_ylabel("$\\theta$ (deg)")
-        ax_g3.set_ylim(0, 180)
-        ax_g3.set_yticks(np.arange(0, 181, 30))
-        fig.colorbar(im, ax=[ax_g3, ax_g2], label="3-body correlation", pad=0.02)
+        images = [self._length_image(int(o), u) for o in orders]
+        n_h = len(signs) * u.size
+        AtA = torch.zeros((n_h, n_h), dtype=torch.float64)
+        Atb = torch.zeros(n_h, dtype=torch.float64)
+        for k, A in enumerate(images):
+            rows = torch.cat([float(c[k]) * A[ir] * A[jr] for c in signs], dim=1)
+            AtA += rows.T @ rows
+            Atb += rows.T @ G[k].real[ir, jr]
+        damp = ridge * torch.trace(AtA) / n_h * torch.eye(n_h, dtype=torch.float64)
+        h = torch.linalg.solve(AtA + damp, Atb).reshape(len(signs), u.size)
+        G_self = torch.stack(
+            [
+                sum(float(c[k]) * (A * hc) @ A.T for c, hc in zip(signs, h))
+                for k, A in enumerate(images)
+            ]
+        )
+        A0 = self._length_image(0, u)
+        G0_self = sum((A0 * hc) @ A0.T for hc in h)  # every direction adds 1 at order 0
+        return G_self.to(G.dtype), G0_self, u, h.numpy()
 
-        if markers is not None:
-            for mk in markers:
-                r_mk, t_mk = mk[0], mk[1]
-                size = 12.0 * (mk[2] ** 0.5) if len(mk) > 2 else 10.0
-                if r_mk <= r_max_display:
-                    ax_g3.plot(r_mk, t_mk, "o", ms=max(size, 5.0), mfc="none",
-                               mec="k", mew=1.0)
+    def _kernel_sphere(self, ell, r=None):
+        """(Nr, Nk) spherical Bessel transform q -> r with the radial weight."""
+        r = self.r if r is None else r
+        w = self.q**2 * self.dq * self.weight
+        return torch.from_numpy(spherical_jn(ell, 2 * np.pi * np.outer(r, self.q)) * w[None, :])
 
-        ax_g2.plot(r[rs], g2_disp[rs], "k-", lw=1)
-        ax_g2.axvspan(r_min, r_max, color="C1", alpha=0.25)
-        ax_g2.axhline(0, color="0.85", lw=0.8, zorder=0)
+    def _kernel_beam(self, n, r=None):
+        """(Nr, Nk) Hankel transform of order n, q_perp -> r, with the radial weight."""
+        r = self.r if r is None else r
+        w = self.q_perp * self.dq_perp * self.weight
+        return torch.from_numpy(jv(n, 2 * np.pi * np.outer(r, self.q_perp)) * w[None, :])
 
-        if r_marks is not None:
-            for r_mk in r_marks:
-                for ax in (ax_g3, ax_g2):
-                    ax.axvline(r_mk, color="k", ls=":", lw=0.8)
-        ax_g2.set_ylabel("2-body corr.")
-        ax_g2.set_xlabel("r, r' (Å)")
-
-        ax_g3.set_title(
-            title if title is not None
-            else f"shell r = {r_min:.2f} - {r_max:.2f}",
-            fontsize=10,
+    def _kernel_classic(self, ell):
+        """(Nr, Nk) spherical Bessel transform of the classic method: the q range
+        [k_min, k_max] with a hard edge, no damping, and the measure
+        (q / q_max)^2 d(q / q_max), which keeps the output dimensionless."""
+        inside = (self.q >= self.k_min) & (self.q <= self.k_max)
+        q_max = self.q[inside][-1]
+        w = np.where(inside, 4 * np.pi * self.q**2 * self.dq / q_max**3, 0.0)
+        return torch.from_numpy(
+            spherical_jn(ell, 2 * np.pi * np.outer(self.r, self.q)) * w[None, :]
         )
 
-        if returnfig:
-            return fig, (ax_g3, ax_g2)
-        plt.show()
+    def _real_space_classic(self, B):
+        G = torch.zeros((len(self.l_values), self.r.size, self.r.size), dtype=torch.float64)
+        for k, ell in enumerate(self.l_values):
+            K = self._kernel_classic(int(ell))
+            G[k] = 2 * np.pi * K @ torch.from_numpy(np.ascontiguousarray(B[k])) @ K.T
+        return G
 
-    def simple_plot(
+    def _real_space_sphere(self, B):
+        G = torch.zeros((len(self.l_values), self.r.size, self.r.size), dtype=torch.float64)
+        for k, ell in enumerate(self.l_values):
+            K = self._kernel_sphere(int(ell))
+            G[k] = 2 * np.pi * (4 * np.pi) ** 3 * K @ torch.from_numpy(B[k]) @ K.T
+        return G
+
+    def _real_space_beam(self, S):
+        G = torch.zeros((len(self.n_values), self.r.size, self.r.size), dtype=torch.complex128)
+        for k, n in enumerate(self.n_values):
+            K = self._kernel_beam(int(n)).to(torch.complex128)
+            G[k] = (2 * np.pi) ** 2 * K @ torch.from_numpy(np.ascontiguousarray(S[k])) @ K.T
+        return G
+
+    def patterson(
         self,
-        padf=None,
-        r_display_power: int = 1,
-        r_max_display: float | None = None,
+        r_max: float = 8.0,
+        r_step: float = 0.05,
+        include_isotropic: bool = False,
+        order_taper: bool = True,
+    ):
+        """
+        Directional Patterson function P(row, col) of the projection, from the
+        mean pattern (the "none" rotation model), on a square grid of half-width
+        r_max (A). By default the isotropic n = 0 part is left out, so the map
+        shows the directional pair vectors.
+
+        Returns the (N, N) image and its pixel size (A).
+        """
+        r = np.arange(0, np.sqrt(2) * r_max + r_step, r_step)
+        n_values = np.arange(0 if include_isotropic else 1, self.n_max + 1)
+        taper = _order_taper(n_values, self.n_max + 1) if order_taper else np.ones(n_values.size)
+        P_n = np.stack(
+            [
+                2
+                * np.pi
+                * (1j**n)
+                * (self._kernel_beam(int(n), r).numpy() @ self.mean_harmonics[n])
+                for n in n_values
+            ]
+        )  # (Nn, Nr)
+        x = np.arange(-r_max, r_max + 0.5 * r_step, r_step)
+        row, col = np.meshgrid(x, x, indexing="ij")
+        rho, phi = np.hypot(row, col), np.arctan2(row, col)
+        image = np.zeros(rho.shape)
+        for t, n, p in zip(taper, n_values, P_n):
+            p_rho = np.interp(rho, r, p.real) + 1j * np.interp(rho, r, p.imag)
+            image += t * (p_rho * np.exp(1j * n * phi)).real * (1 if n == 0 else 2)
+        return image, r_step
+
+    # ------------------------------------------------------------------ model
+
+    def model_correlation(self, clusters, return_self: bool = False):
+        """
+        PADF of atomic models, processed like the last correlation() call:
+        same model, method, grid, q range, radial weight, order taper and
+        self-term removal. The correlation of all interatomic vectors within each cluster is
+        summed over clusters, so it holds two-, three- and four-body terms, as
+        the diffraction correlation does. For the beam model the positions are
+        projected along the beam (the last coordinate).
+
+        clusters : iterable of (N, 3) arrays of positions (A), (row, col, beam).
+        return_self : also return the self term of the model, like Theta_self.
+        Returns Theta on the stored (r, theta_deg) grid.
+        """
+        r_model = np.arange(0, self.r[-1] + 2.0, self.r[1] - self.r[0])
+        if self.model == "sphere":
+            H = _cluster_power_sphere(clusters, r_model, self.l_values)  # sum_m conj(P_lm) P_lm
+            G = torch.zeros((len(self.l_values), self.r.size, self.r.size), dtype=torch.float64)
+            dr = r_model[1] - r_model[0]
+            for k, ell in enumerate(self.l_values):
+                Kr = torch.from_numpy(
+                    spherical_jn(int(ell), 2 * np.pi * np.outer(self.q, r_model))
+                    * (r_model**2 * dr)[None, :]
+                )
+                B = 4 * np.pi * Kr @ H[k] @ Kr.T  # band-limited to the measured q
+                if self.method == "classic":
+                    K = self._kernel_classic(int(ell))
+                    G[k] = 2 * np.pi * K @ B @ K.T
+                else:
+                    K = self._kernel_sphere(int(ell))
+                    G[k] = 2 * np.pi * (4 * np.pi) ** 3 * K @ B @ K.T
+            if self.method == "classic":
+                if return_self:
+                    raise ValueError("the classic method has no self term")
+                return self._angular_sum(G)[1]
+            return self._model_output(G, return_self)
+        H = _cluster_power_beam(clusters, r_model, self.n_values)
+        G = torch.zeros((len(self.n_values), self.r.size, self.r.size), dtype=torch.complex128)
+        dr = r_model[1] - r_model[0]
+        for k, n in enumerate(self.n_values):
+            Kr = torch.from_numpy(
+                jv(int(n), 2 * np.pi * np.outer(self.q_perp, r_model)) * (r_model * dr)[None, :]
+            )
+            Kr = Kr.to(torch.complex128)
+            S = (2 * np.pi) ** 2 * Kr @ H[k] @ Kr.T
+            K = self._kernel_beam(int(n)).to(torch.complex128)
+            G[k] = (2 * np.pi) ** 2 * K @ S @ K.T
+        return self._model_output(G, return_self)
+
+    def _model_output(self, G, return_self):
+        G_self, G0_self, _, _ = self._self_term(G)
+        Theta = self._angular_sum(G - G_self)[1]
+        if return_self:
+            return Theta, self._angular_sum(G_self, G0_self.numpy())[1]
+        return Theta
+
+    def pair_distribution(self):
+        """
+        Pair distribution of the mean pattern (the first moment) on the r grid of
+        the last correlation() call, with the same rotation model and radial
+        weight: the density of pair vectors at each length relative to its
+        mean, rho (g(r) - 1) up to a scale, in 3D (sphere) or projected (beam).
+        This is the two-body information the self term would repeat in Theta.
+        """
+        return self._radial_transform(self.mean_harmonics[0].real - 1.0)
+
+    def neighbor_shell(self, n: int = 1, g2=None, min_fraction: float = 0.3):
+        """
+        (r_lo, r_hi) of the n-th neighbor shell (A): around the n-th peak of the
+        pair distribution weighted by r^2 (sphere) or r (beam), out to where it
+        falls to the mean pair density or to a minimum, whichever comes first.
+        Peaks count where the unweighted pair distribution is above
+        min_fraction of its largest value beyond 1 A.
+
+        g2 : pair distribution on the r grid; by default pair_distribution().
+        """
+        g2 = self.pair_distribution() if g2 is None else np.asarray(g2, dtype=np.float64)
+        y = g2 * self.r ** (1.0 if self.model == "beam" else 2.0)
+        floor = min_fraction * g2[self.r > 1.0].max()
+        peaks = [
+            k
+            for k in range(1, y.size - 1)
+            if self.r[k] > 1.0 and g2[k] > floor and y[k] > y[k - 1] and y[k] >= y[k + 1]
+        ]
+        if len(peaks) < n:
+            raise ValueError(f"the pair distribution has {len(peaks)} shells, fewer than {n}")
+        lo = hi = peaks[n - 1]
+        while lo > 0 and y[lo] > 0 and y[lo - 1] < y[lo]:
+            lo -= 1
+        while hi < y.size - 1 and y[hi] > 0 and y[hi + 1] < y[hi]:
+            hi += 1
+        return float(self.r[lo]), float(self.r[hi])
+
+    def model_pair_distribution(self, clusters):
+        """
+        pair_distribution of atomic models: the mean intensity of all their
+        interatomic distances (Debye sum; projected along the beam for the
+        beam model), band-limited like the data.
+
+        clusters : iterable of (N, 3) arrays of positions (A), (row, col, beam).
+        """
+        bin_width = 0.01
+        counts = torch.zeros(0, dtype=torch.float64)
+        for pos in clusters:
+            pos = torch.as_tensor(np.asarray(pos), dtype=torch.float64)
+            pos = pos[:, :2] if self.model == "beam" else pos
+            i, j = torch.triu_indices(pos.shape[0], pos.shape[0], offset=1)
+            index = torch.round(torch.linalg.norm(pos[i] - pos[j], dim=1) / bin_width).long()
+            if index.max() >= counts.numel():
+                counts = torch.cat(
+                    [
+                        counts,
+                        torch.zeros(int(index.max()) + 1 - counts.numel(), dtype=torch.float64),
+                    ]
+                )
+            counts.index_add_(0, index, torch.ones_like(index, dtype=torch.float64))
+        u = np.arange(counts.numel()) * bin_width
+        if self.model == "sphere":
+            pairs = np.sinc(2 * np.outer(self.q, u))  # j0(2 pi q u)
+        else:
+            pairs = jv(0, 2 * np.pi * np.outer(self.q_perp, u))
+        return self._radial_transform(pairs @ counts.numpy())
+
+    def _radial_transform(self, intensity):
+        """Isotropic (order 0) transform of a radial intensity to the r grid."""
+        if self.model == "sphere":
+            return 4 * np.pi * self._kernel_sphere(0).numpy() @ intensity
+        return 2 * np.pi * self._kernel_beam(0).numpy() @ intensity
+
+    # ------------------------------------------------------------------ plotting
+
+    def plot_correlation(
+        self,
+        Theta=None,
         r_fixed=None,
-        theta_marks=None,
-        r_marks=None,
+        r_shell=None,
+        marks=None,
         title=None,
+        r_display_power: float | None = None,
+        r_max_display: float | None = None,
+        subtract_median: bool | None = None,
+        g2=None,
+        self_term=None,
+        mark_radius: float = 0.15,
         axsize: tuple[float, float] = (4.5, 3.5),
         returnfig: bool = False,
     ):
         """
-        Maps of the PADF against theta (y-axis, 0 to 180 deg) and r (x-axis),
-        one panel per volume in a single row: the r = r' diagonal
-        Theta(r, r, theta), or Theta(r_fixed, r', theta) when r_fixed is given.
-        The display is weighted by (r r')^r_display_power.
+        Maps of Theta against angle (y-axis) and r (x-axis), one panel per volume
+        in a single row: the r = r' diagonal; Theta(r_fixed, r', theta) when
+        r_fixed is given; or Theta integrated over r in a shell when r_shell is
+        given, such as the first-neighbor shell from neighbor_shell(). The
+        display is weighted by (r r')^p, or by r^(2p) dr over the shell and r'^p,
+        with p = r_display_power (default 1 for the sphere model, 0.5 for beam).
+        subtract_median (default on for beam) subtracts the median over the
+        interior angles at each r. Color limits use 15-165 deg and
+        r <= r_max_display.
 
-        padf : (Nr, Nr, Ntheta) array, or a list of them, or None
-            Volumes on the same (r, theta) grid, e.g. a model PADF; defaults to self.padf.
-        r_fixed : float, list of float (one per panel) or None
-            Fixed first radius (Angstroms) for each panel.
-        theta_marks, r_marks : sequence of float, list of them (one per panel) or None
-            Angles (degrees) and radii (Angstroms) marked with dotted lines.
-        title : str or list of str (one per panel)
-        Each panel has symmetric color limits from its largest |value| at
-        15-165 deg and r <= r_max_display.
+        Theta : (Nr, Nr, Ntheta) array, a list of them, or None for self.Theta.
+        r_fixed : r (A), shared or one per panel.
+        r_shell : (r_lo, r_hi) (A), shared, or a list with one per panel.
+        marks : (r', angle) points (A, deg) circled with dashed lines, such as
+            the output of pair_vector_marks, shared or one list per panel.
+        g2 : (Nr,) pair distribution drawn below each map on the same r axis,
+            weighted by r^(2p) and scaled to 1, with the shell or r_fixed
+            highlighted, such as pair_distribution() or
+            model_pair_distribution(); shared or one per panel.
+        self_term : self term added to the maps for display, each pair vector
+            correlated with itself and its reverse: True for Theta_self when
+            Theta is None, or Theta_self and the second output of
+            model_correlation(..., return_self=True), one per panel.
+        mark_radius : radius of the circles (inches).
         """
-        vols = [self.padf] if padf is None else (list(padf) if isinstance(padf, (list, tuple)) else [padf])
+        vols = (
+            [self.Theta]
+            if Theta is None
+            else (list(Theta) if isinstance(Theta, (list, tuple)) else [Theta])
+        )
         n = len(vols)
+        beam = self.model == "beam"
+        power = (0.5 if beam else 1.0) if r_display_power is None else r_display_power
+        subtract = beam if subtract_median is None else subtract_median
         titles = _per_panel(title, n)
         r_fixeds = list(r_fixed) if isinstance(r_fixed, (list, tuple)) else [r_fixed] * n
-        theta_markss = _per_panel(theta_marks, n, nested=True)
-        r_markss = _per_panel(r_marks, n, nested=True)
-        r = np.asarray(self.r)
-        theta_deg = np.asarray(self.theta_deg)
-        rs = r <= (r.max() if r_max_display is None else r_max_display)
-        interior = (theta_deg > 15) & (theta_deg < 165)
+        shells = (
+            list(r_shell)
+            if isinstance(r_shell, list)
+            else [None if r_shell is None else tuple(r_shell)] * n
+        )
+        markss = _per_panel(marks, n, nested=True, depth=2)
+        g2s = _per_panel(g2, n, nested=True, depth=1)
+        if self_term is True:
+            self_term = self.Theta_self
+        if self_term is not None and self_term is not False:
+            selfs = list(self_term) if isinstance(self_term, (list, tuple)) else [self_term] * n
+            vols = [np.asarray(v) + np.asarray(t) for v, t in zip(vols, selfs)]
+        r, theta = self.r, self.theta_deg
+        dr = r[1] - r[0]
+        rs = r <= (r[-1] if r_max_display is None else r_max_display)
+        interior = (theta % 180 > 15) & (theta % 180 < 165)
+        theta_max = theta[-1]
 
-        fig, axs = plt.subplots(1, n, figsize=(axsize[0] * n, axsize[1]), squeeze=False, constrained_layout=True)
-        for ax, vol, t, r0, t_marks, rm_marks in zip(axs[0], vols, titles, r_fixeds, theta_markss, r_markss):
+        fig, axs = plt.subplots(
+            1 if g2 is None else 2,
+            n,
+            figsize=(axsize[0] * n, axsize[1] * (1 if g2 is None else 1.4)),
+            squeeze=False,
+            sharex="col",
+            height_ratios=[1] if g2 is None else [2.5, 1],
+            constrained_layout=True,
+        )
+        for k, (ax, vol, t, r0, shell, panel_marks) in enumerate(
+            zip(axs[0], vols, titles, r_fixeds, shells, markss)
+        ):
             vol = vol.numpy() if isinstance(vol, torch.Tensor) else np.asarray(vol)
-            if r0 is None:
-                m = np.einsum("iik->ik", vol)[rs] * (r[rs] ** (2 * r_display_power))[:, None]
-                xlabel, label = "r = r' (Å)", rf"$\Theta(r, r, \theta) \cdot r^{{{2 * r_display_power}}}$"
-            else:
+            if shell is not None:
+                inside = (r >= shell[0]) & (r <= shell[1])
+                w = r[inside] ** (2 * power) * dr
+                m = np.tensordot(w, vol[inside], axes=(0, 0))[rs] * (r[rs] ** power)[:, None]
+                xlabel = f"r' (Å), r from {shell[0]:.2f} to {shell[1]:.2f} Å"
+                label = rf"$\int \Theta \, r^{{{2 * power:g}}} dr \cdot r'^{{{power:g}}}$"
+            elif r0 is not None:
                 i0 = int(np.argmin(np.abs(r - r0)))
-                m = vol[i0][rs] * ((r[i0] * r[rs]) ** r_display_power)[:, None]
-                xlabel, label = f"r' (Å), r = {r[i0]:.2f} Å", rf"$\Theta(r, r', \theta) \cdot (r r')^{{{r_display_power}}}$"
+                m = vol[i0][rs] * ((r[i0] * r[rs]) ** power)[:, None]
+                xlabel = f"r' (Å), r = {r[i0]:.2f} Å"
+                label = rf"$\Theta \cdot (r r')^{{{power:g}}}$"
+            else:
+                m = np.einsum("iik->ik", vol)[rs] * (r[rs] ** (2 * power))[:, None]
+                xlabel = "r = r' (Å)"
+                label = rf"$\Theta \cdot (r r')^{{{power:g}}}$"
+            if subtract:
+                m = m - np.median(m[:, interior], axis=1, keepdims=True)
             vmax = np.abs(m[:, interior]).max()
-            im = ax.pcolormesh(r[rs], theta_deg, m.T, cmap="RdBu_r", vmin=-vmax, vmax=vmax,
-                               shading="auto")
-            for th in t_marks or []:
-                ax.axhline(th, color="k", ls=":", lw=1)
-            for rm in rm_marks or []:
-                ax.axvline(rm, color="k", ls=":", lw=1)
-            ax.set_xlabel(xlabel)
-            ax.set_ylabel(r"$\theta$ (deg)")
-            ax.set_ylim(0, 180)
-            ax.set_yticks(np.arange(0, 181, 30))
+            im = ax.pcolormesh(
+                r[rs], theta, m.T, cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="auto"
+            )
+            for rm, th in panel_marks if panel_marks is not None else []:
+                ax.add_patch(  # fixed size on screen, centered on the data point
+                    Circle(
+                        (0, 0),
+                        mark_radius,
+                        transform=fig.dpi_scale_trans + ScaledTranslation(rm, th, ax.transData),
+                        fill=False,
+                        ec="k",
+                        ls="--",
+                        lw=1,
+                    )
+                )
+            ax.set_xlim(r[rs][0], r[rs][-1])
+            ax.set_ylabel(r"$\Delta\phi$ (deg)" if beam else r"$\theta$ (deg)")
+            ax.set_ylim(0, theta_max)
+            ax.set_yticks(np.arange(0, theta_max + 1, 30 if theta_max <= 180 else 60))
             fig.colorbar(im, ax=ax, label=label)
             if t is not None:
                 ax.set_title(t)
+            bottom = ax
+            if g2 is not None:
+                bottom = axs[1, k]
+                y = np.asarray(g2s[k], dtype=np.float64)[rs] * r[rs] ** (2 * power)
+                if shell is not None:
+                    bottom.axvspan(*shell, color="tab:orange", alpha=0.3, lw=0)
+                elif r0 is not None:
+                    bottom.axvline(r[int(np.argmin(np.abs(r - r0)))], color="tab:orange", lw=2)
+                bottom.plot(r[rs], y / np.abs(y).max(), color="k", lw=1.5)
+                bottom.axhline(0, color="0.6", lw=0.8)
+                bottom.set_ylabel(rf"$g_2 \cdot r^{{{2 * power:g}}}$")
+                fig.colorbar(im, ax=bottom).ax.set_visible(False)  # keeps the r axes aligned
+            bottom.set_xlabel(xlabel)
         if returnfig:
             return fig, axs[0]
         plt.show()
 
-    def plot_angular_correlation(
-        self,
-        q: float,
-        figsize: tuple[float, float] = (5, 3.5),
-        returnfig: bool = False,
-    ):
-        """
-        Median-subtracted angular correlation C(dphi, q, q') at the radial bin
-        nearest q (1/Angstroms), against q' (x-axis) and dphi (y-axis).
-        """
-        C = self.ang_corr_corrected.numpy()
-        q_axis = self.q
-        iq = int(np.argmin(np.abs(q_axis - q)))
-        dphi = np.arange(C.shape[0]) * 360.0 / C.shape[0]
-        M = C[:, iq, :]
-        vmax = np.quantile(np.abs(M), 0.995)
-        fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
-        im = ax.pcolormesh(q_axis, dphi, M, cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="auto")
-        ax.set_xlabel("q' (1/Å)")
-        ax.set_ylabel(r"$\Delta\phi$ (deg)")
-        ax.set_ylim(0, 360)
-        ax.set_yticks(np.arange(0, 361, 60))
-        ax.set_title(f"q = {q_axis[iq]:.3f} 1/Å")
-        fig.colorbar(im, ax=ax, label=r"$C(\Delta\phi, q, q')$")
-        if returnfig:
-            return fig, ax
-        plt.show()
 
-
-# Band-limit a model g3(r, r', theta) to what a PADF measurement can resolve
-# (pypadf blfilter.py approach): expand in P_l(cos theta) for even l < l_max,
-# take each order to the measured q points with the order-l spherical Bessel
-# transform, and transform back.
-def bandlimit_volume(
-    G: NDArray,
-    r: NDArray,
-    theta_deg: NDArray,
-    q: NDArray,
-    l_max: int = 40,
-) -> NDArray:
+def pair_vector_marks(
+    positions,
+    r_fixed: float,
+    r_max: float,
+    model: str = "sphere",
+    tol: float = 0.05,
+    min_fraction: float = 0.45,
+    n_shells: int | None = None,
+    n_centers: int = 64,
+):
     """
-    Parameters
-    ----------
-    G : (Nr, Nr, Ntheta) array
-        Volume on a uniform r grid, theta in [0, 180] degrees.
-    r : (Nr,) array
-        Radial grid (Angstroms), uniformly spaced.
-    theta_deg : (Ntheta,) array
-        Angles in degrees.
-    q : (Nq,) array
-        Measured q values (1/Angstroms, no 2 pi), uniformly spaced.
-    l_max : int
-        Even orders l = 0, 2, ..., < l_max are kept (same as extract_Bl_matrices).
+    Expected peaks (r', angle) of the PADF of an ordered
+    structure with one vector of length r_fixed: the angles between its pair
+    vectors of length r_fixed and its pair vectors of each length up to r_max,
+    for the marks of plot_correlation.
 
-    Returns
-    -------
-    (Nr, Nr, Ntheta) array, the band-limited volume.
+    positions : (N, 2) or (N, 3) atom positions (A) of a patch that extends
+        more than r_max beyond the atoms near its center.
+    model : "sphere" (3D angles, 0 to 180 deg) or "beam" (positions projected
+        along the last axis, angles from 0 to 360 deg).
+    tol : distance tolerance (A) of a shell.
+    min_fraction : shells and angles rarer than this fraction of the
+        nearest-neighbor shell, or of the most frequent angle in their shell,
+        are left out.
+    n_shells : keep only this many shells, starting from the shortest.
+
+    Angles within 5 deg of the axis limits, and the 180 deg between a vector and
+    its reverse at r' = r_fixed, are left out. Returns a list of (r', angle).
     """
-    G = torch.as_tensor(np.asarray(G), dtype=torch.float64)
-    theta = torch.deg2rad(torch.as_tensor(np.asarray(theta_deg), dtype=torch.float64))
-    l_values = torch.arange(0, l_max, 2, dtype=torch.float64)
+    pos = np.asarray(positions, dtype=np.float64)
+    pos = pos[:, :2] if model == "beam" else pos
+    theta_max = 360.0 if model == "beam" else 180.0
+    d_center = np.linalg.norm(pos - pos.mean(0), axis=1)
+    inner = np.flatnonzero(d_center < 0.5 * np.ptp(pos, axis=0).min() - r_max - tol)
+    if inner.size == 0:
+        raise ValueError("positions must extend more than r_max around their center")
+    centers = inner[np.argsort(d_center[inner])[:n_centers]]
+    vec = (pos[None, :, :] - pos[centers][:, None, :]).reshape(-1, pos.shape[1])
+    length = np.linalg.norm(vec, axis=1)
+    keep = (length > tol) & (length < r_max + tol)
+    vec, length = vec[keep], length[keep]
+    # distinct vectors (to 0.01 tol) and how often they occur
+    _, first, count = np.unique(
+        np.round(vec / (0.01 * tol)), axis=0, return_index=True, return_counts=True
+    )
+    vec, length = vec[first], length[first]
+    order = np.argsort(length)
+    vec, count, length = vec[order], count[order], length[order]
+    shell_id = np.concatenate([[0], np.cumsum(np.diff(length) > tol)])
+    shell_r = np.array([length[shell_id == s].mean() for s in range(shell_id[-1] + 1)])
+    shell_n = np.array([count[shell_id == s].sum() for s in range(shell_id[-1] + 1)])
+    fixed = int(np.argmin(np.abs(shell_r - r_fixed)))
+    a, wa = vec[shell_id == fixed], count[shell_id == fixed]
 
-    # Legendre projection over theta with the sin(theta) d(theta) measure
-    w = torch.abs(torch.sin(theta)) * torch.gradient(theta)[0]
-    P = torch.special.legendre_polynomial_p(torch.cos(theta)[None, :], l_values[:, None])  # (Nl, Ntheta)
-    Gl = torch.einsum("ijt,lt->lij", G, P * w[None, :]) * (2 * l_values[:, None, None] + 1) / 2
+    marks = []
+    for s in np.flatnonzero(shell_n >= min_fraction * shell_n[fixed])[:n_shells]:
+        b, wb = vec[shell_id == s], count[shell_id == s]
+        if model == "beam":
+            ang = (
+                np.degrees(
+                    np.arctan2(b[None, :, 1], b[None, :, 0])
+                    - np.arctan2(a[:, None, 1], a[:, None, 0])
+                )
+                % 360
+            )
+        else:
+            cos = (a @ b.T) / np.outer(np.linalg.norm(a, axis=1), np.linalg.norm(b, axis=1))
+            ang = np.degrees(np.arccos(np.clip(cos, -1, 1)))
+        ang, w = ang.ravel(), np.outer(wa, wb).ravel()
+        bins = np.round(ang).astype(int)
+        hist = np.bincount(bins, weights=w, minlength=int(theta_max) + 1)
+        strong = np.flatnonzero(hist >= min_fraction * hist.max())
+        for run in np.split(
+            strong, np.flatnonzero(np.diff(strong) > 1) + 1
+        ):  # merge adjacent degrees
+            inside = np.isin(bins, run)
+            deg = round(float(np.average(ang[inside], weights=w[inside])), 1)
+            same_shell_reverse = s == fixed and abs(deg - 180) < 5
+            if 5 <= deg <= theta_max - 5 and not same_shell_reverse:
+                marks.append((round(float(shell_r[s]), 2), float(deg)))
+    return marks
 
-    out = torch.zeros_like(G)
-    for k, l in enumerate(l_values.int().tolist()):
-        out += _bandlimit_order(Gl[k], l, r, q)[:, :, None] * P[k][None, None, :]
-    return out.numpy()
+
+class OrderParameter(NamedTuple):
+    """Result of order_parameter: the crystalline ordering Omega, its standard
+    error and confidence interval (by default the 10th to 90th percentile), and
+    the ordering rho_b in each r_eff bin."""
+
+    value: float
+    standard_error: float
+    interval: tuple[float, float]
+    r_eff: np.ndarray
+    profile: np.ndarray
 
 
-def order_taper(orders, order_max):
+def order_parameter(
+    Theta_groups,
+    Theta_self_groups,
+    r,
+    theta_deg,
+    r_range: tuple[float, float] = (5.0, 10.0),
+    r_min: float = 2.0,
+    r_bin: float = 1.0,
+    confidence: float = 0.8,
+) -> OrderParameter:
+    """
+    Crystalline ordering Omega from the data alone: the fraction of the angular
+    variance of the PADF that comes from correlations between distinct pair
+    vectors, rather than from each pair vector correlated with itself.
+
+    Each point (r, r', theta) correlates two pair vectors, and r_eff =
+    max(r, r') is the distance over which it tests the order. The points are
+    sorted into bins of r_eff, and in each bin
+
+        rho_b = D_b / (D_b + S_b),
+
+    where D_b and S_b are the variances of Theta (distinct pair vectors) and of
+    Theta_self over the bin, about their means, with each angle weighted by its
+    solid angle, sin(theta) (beam maps, from 0 to 360 deg, are weighted
+    uniformly). Omega is the mean of rho_b over the bins. It is near 1 when the
+    sample keeps the orientation of its pair vectors over r_eff, as a crystal
+    does, and near 0.2 for a liquid. The default r_range starts beyond the
+    first few neighbor shells, at about twice the nearest-neighbor distance of
+    Si: closer in, each pair vector has few distinct partners, and even a
+    perfect crystal keeps much of its variance in the self term (rho_b of 0.3
+    to 0.8 for Si from 2 to 5 A). Only points where both pair vectors are at
+    least r_min long are used, since shorter than the nearest-neighbor distance
+    the maps hold only noise. Bins narrower than the spacing of the neighbor
+    shells alternate between bins that hold a shell and bins between shells;
+    with 1 A bins every bin of Si holds a shell.
+
+    Noise adds variance that looks like order. The patterns are therefore split
+    into K independent groups (contiguous blocks of the scan larger than the
+    grains), each solved by correlation() with the same settings, and D_b and
+    S_b are averaged over the products of different groups, whose noise is
+    independent. Negative values of D_b and S_b, from noise, are set to 0, so
+    that rho_b stays between 0 and 1. Leaving out one group
+    at a time (jackknife) gives the standard error, and the interval uses
+    Student's t with K - 1 degrees of freedom, clipped to [0, 1]. A wide
+    interval means the data cannot measure Omega at that dose and number of
+    patterns.
+
+    Theta_groups, Theta_self_groups : K >= 3 maps (Nr, Nr, Ntheta) each, the
+        Theta and Theta_self of correlation() for each group.
+    r, theta_deg : grids of the maps.
+    r_range, r_bin : bins of r_eff (A); r_range[1] must fit inside the
+        illuminated volume and the r grid of the maps.
+    r_min : shortest pair vector used (A), about the nearest-neighbor distance.
+    confidence : of the interval, 0.8 for the 10th to 90th percentile.
+
+    Example, with 16 blocks of a 256 x 256 scan ds:
+
+        blocks = [ds[i : i + 64, j : j + 64] for i in range(0, 256, 64) for j in range(0, 256, 64)]
+        groups = [PairAngleDistributionFunction(b, fq=f, k_min=0.1, split_counts=True) for b in blocks]
+        maps = [g.correlation("sphere", r_max=10.0)[1] for g in groups]
+        omega = order_parameter(maps, [g.Theta_self for g in groups], groups[0].r, groups[0].theta_deg)
+    """
+    T, S = (
+        torch.as_tensor(np.stack([np.asarray(x) for x in maps]), dtype=torch.float64)
+        for maps in (Theta_groups, Theta_self_groups)
+    )
+    K = T.shape[0]
+    if K < 3:
+        raise ValueError(f"order_parameter needs at least 3 groups, got {K}")
+    if T.shape != S.shape:
+        raise ValueError(f"Theta {tuple(T.shape)} and Theta_self {tuple(S.shape)} differ")
+    theta = torch.as_tensor(np.asarray(theta_deg), dtype=torch.float64)
+    if theta.max() <= 180:
+        weight = torch.sin(torch.deg2rad(theta)).clamp(min=0)  # solid angle on the sphere
+    else:
+        weight = torch.ones_like(theta)  # angles around the beam
+    root = torch.sqrt(weight / weight.mean())
+
+    def centered(x):
+        """Values of one bin (K, n, Ntheta) minus their weighted mean, times sqrt(weight)."""
+        mean = (x * weight).sum((-2, -1), keepdim=True) / (weight.sum() * x.shape[-2])
+        return ((x - mean) * root).reshape(K, -1)
+
+    r = torch.as_tensor(np.asarray(r), dtype=torch.float64)
+    r_eff = torch.maximum(r[:, None], r[None, :])
+    r_short = torch.minimum(r[:, None], r[None, :])
+    n_bins = int(round((r_range[1] - r_range[0]) / r_bin))
+    edges = r_range[0] + r_bin * np.arange(n_bins + 1)
+    grams = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        inside = (r_eff >= lo) & (r_eff < hi) & (r_short >= r_min)
+        if not inside.any():
+            raise ValueError(f"the r_eff bin from {lo:g} to {hi:g} A holds no points of the maps")
+        g, s = centered(T[:, inside]), centered(S[:, inside])
+        grams.append((g @ g.T, s @ s.T))
+
+    def profile(w):
+        """rho_b from the groups with weights w (0 leaves a group out)."""
+        W = torch.outer(w, w)
+        W.fill_diagonal_(0.0)  # products of different groups only
+        out = []
+        for G, Sg in grams:
+            d = torch.clamp((W * G).sum() / W.sum(), min=0.0)
+            total = d + torch.clamp((W * Sg).sum() / W.sum(), min=0.0)
+            out.append(d / total if total > 0 else torch.zeros((), dtype=torch.float64))
+        return torch.stack(out)
+
+    full = profile(torch.ones(K, dtype=torch.float64))
+    value = float(full.mean())
+    jack = torch.stack(
+        [profile((torch.arange(K) != i).to(torch.float64)).mean() for i in range(K)]
+    )
+    se = float(torch.sqrt((K - 1) / K * ((jack - jack.mean()) ** 2).sum()))
+    t = float(stdtrit(K - 1, 0.5 + 0.5 * confidence))
+    interval = (max(value - t * se, 0.0), min(value + t * se, 1.0))
+    return OrderParameter(value, se, interval, 0.5 * (edges[:-1] + edges[1:]), full.numpy())
+
+
+def _split_counts(item, origin, gen):
+    """Two random halves of the electron counts of every pattern (binomial
+    thinning), and the pattern origin, found once from the full counts."""
+    if isinstance(item, Polar4dstem):
+        raise ValueError("split_counts needs the detector counts, not polar data")
+    ds = as_dataset4dstem(item)
+    counts = torch.as_tensor(np.asarray(ds.array), dtype=torch.float64)
+    if counts.min() < 0 or not torch.equal(counts, torch.round(counts)):
+        raise ValueError("split_counts needs non-negative integer counts")
+    half = torch.binomial(counts, torch.full_like(counts, 0.5), generator=gen)
+    a, b = (
+        Dataset4dstem.from_array(x.numpy(), origin=ds.origin, sampling=ds.sampling, units=ds.units)
+        for x in (half, counts - half)
+    )
+    return a, b, _pattern_origin(ds, origin)
+
+
+def _pattern_origin(ds, origin):
+    """Pixel of q = 0: origin if given, else from the calibration, else found
+    with find_origin_angular_grid when the calibration has no offset."""
+    if origin is not None:
+        return origin
+    offset = np.asarray(ds.origin, dtype=float)[-2:]
+    sampling = np.asarray(ds.sampling, dtype=float)[-2:]
+    return -offset / sampling if np.any(offset != 0) else find_origin_angular_grid(ds)
+
+
+def _bright_field_radius(q, intensity):
+    """
+    Radius of the bright-field disk: where the azimuthal mean intensity first
+    falls halfway from its level inside the disk to the level just outside.
+    With no disk, only the central beam, it is within a bin of q = 0.
+    """
+    below = np.flatnonzero(intensity < 0.5 * intensity[0])
+    if below.size == 0:
+        return 0.0
+    j = int(below[0])
+    level_in = np.median(intensity[: max(1, int(0.7 * j))])
+    level_out = np.median(intensity[j + 1 : j + 2 + max(1, j // 3)])
+    k = int(np.flatnonzero(intensity < 0.5 * (level_in + level_out))[0])
+    if k == 0:
+        return 0.0
+    frac = (intensity[k - 1] - 0.5 * (level_in + level_out)) / (intensity[k - 1] - intensity[k])
+    return float(q[k - 1] + frac * (q[k] - q[k - 1]))
+
+
+def _radial_window(q, k_min, k_max, taper):
+    """1 inside [k_min + taper[0], k_max - taper[1]], cosine ramps to 0 at k_min and k_max."""
+    lo, hi = taper
+    w = np.ones_like(q)
+    w[(q < k_min) | (q > k_max)] = 0
+    ramp = (q >= k_min) & (q < k_min + lo)
+    w[ramp] = np.sin(0.5 * np.pi * (q[ramp] - k_min) / lo) ** 2
+    ramp = (q > k_max - hi) & (q <= k_max)
+    w[ramp] = np.cos(0.5 * np.pi * (q[ramp] - (k_max - hi)) / hi) ** 2
+    return w
+
+
+def _order_taper(orders, order_max):
     """cos^2 taper of harmonic orders, 1 at order 0 and 0 at order_max."""
     return np.cos(0.5 * np.pi * np.asarray(orders, dtype=np.float64) / order_max) ** 2
 
 
-def _bandlimit_order(Gl: torch.Tensor, l: int, r, q) -> torch.Tensor:
-    """Order-l spherical Bessel transform of Gl(r, r') to the q points and back."""
-    r = np.asarray(r, dtype=np.float64)
-    q = np.asarray(q, dtype=np.float64)
-    jl = torch.from_numpy(spherical_jn(l, 2 * np.pi * np.outer(q, r)))  # (Nq, Nr), not in torch
-    fwd = 4 * np.pi * jl * torch.from_numpy(r**2 * (r[1] - r[0]))[None, :]  # r -> q
-    inv = 4 * np.pi * jl.T * torch.from_numpy(q**2 * (q[1] - q[0]))[None, :]  # q -> r
-    return inv @ (fwd @ Gl @ fwd.T) @ inv.T
-
-
-def _real_sph_harm_power(cos_t, sin_t, phi, l_values, weights, n_r, index):
+def _solve_sphere(S, beta, l_values):
     """
-    sum_m A_lm(r) conj(A_lm(r')) for each l in l_values, where
-    A_lm(r) = sum_v weights[v] Y_lm(v) binned to r by index (Nvec,) -> [0, n_r].
-    Orthonormal associated Legendre functions by the standard stable
-    recurrence in l at fixed m; m < 0 enters through |A_l,-m| = |A_lm|.
+    Least-squares B_l(q, q') for each radius pair from the real second moment
+    S (n, k, k'), n = 0 ... n_max. The angular correlation of the rings k and k',
+    C(psi) = S_0 + 2 sum_n S_n cos(n psi), equals sum_l B_l P_l(cos gamma) with
+    cos gamma = cos(beta) cos(beta') + sin(beta) sin(beta') cos(psi). The even
+    orders up to n_max (or l_max, if larger) and l = 0 are fitted to C with the
+    solid-angle weight d(cos gamma), on Gauss-Legendre nodes in cos(psi) that
+    integrate every harmonic of S exactly, and the orders l_values are returned.
+    The weight keeps orders above the fit from folding into the fitted ones (on
+    a flat Ewald sphere the P_l are orthogonal), and the extra orders up to n_max
+    absorb what the curved sphere, whose cones miss the angles near 180 deg,
+    would otherwise leak.
     """
-    l_max = int(l_values.max())
-    C = torch.zeros((len(l_values), n_r, n_r), dtype=torch.float64)
-    row = {int(l): k for k, l in enumerate(l_values.tolist())}
-    p_mm = torch.full_like(cos_t, (1 / (4 * np.pi)) ** 0.5)
-    for m in range(l_max + 1):
-        if m > 0:
-            p_mm = -((2 * m + 1) / (2 * m)) ** 0.5 * sin_t * p_mm
-        e = torch.polar(torch.ones_like(phi), m * phi) * weights
-        p_prev, p_l = None, p_mm
-        for l in range(m, l_max + 1):
-            if l == m + 1:
-                p_prev, p_l = p_l, (2 * m + 3) ** 0.5 * cos_t * p_l
-            elif l > m + 1:
-                a = ((4 * l * l - 1) / (l * l - m * m)) ** 0.5
-                b = (((l - 1) ** 2 - m * m) / (4 * (l - 1) ** 2 - 1)) ** 0.5
-                p_prev, p_l = p_l, a * (cos_t * p_l - b * p_prev)
-            if l in row:
-                A = torch.zeros(n_r + 1, dtype=torch.complex128).index_add_(0, index, p_l * e)[:n_r]
-                C[row[l]] += (1.0 if m == 0 else 2.0) * torch.real(A.conj()[:, None] * A[None, :])
-    return C
+    l_values = np.asarray(l_values)
+    n_max, n_k = S.shape[0] - 1, S.shape[1]
+    l_top = max(int(l_values[-1]), n_max - n_max % 2)
+    l_fit = np.arange(0, l_top + 1, 2)
+    keep = torch.as_tensor(np.searchsorted(l_fit, l_values))
+    t, w = np.polynomial.legendre.leggauss((n_max + l_top) // 2 + 2)
+    t, root = torch.from_numpy(t), torch.from_numpy(np.sqrt(w))
+    n = torch.arange(n_max + 1, dtype=torch.float64)
+    T = torch.cos(n[None, :] * torch.arccos(t)[:, None]) * torch.where(n == 0, 1.0, 2.0)
+    C = torch.einsum("jn,nkp->jkp", T, torch.from_numpy(np.ascontiguousarray(S)))  # (J, Nk, Nk)
+    beta = torch.as_tensor(np.asarray(beta), dtype=torch.float64)
+    cb, sb = torch.cos(beta), torch.sin(beta)
+    B = torch.zeros((len(l_values), n_k, n_k), dtype=torch.float64)
+    for k in range(n_k):
+        x = cb[k] * cb[:, None] + sb[k] * sb[:, None] * t[None, :]  # (Nk', J) cos(gamma)
+        P = [torch.ones_like(x), x]
+        for ell in range(1, l_top):
+            P.append(((2 * ell + 1) * x * P[ell] - ell * P[ell - 1]) / (ell + 1))
+        A = torch.stack([P[int(ell)] for ell in l_fit], -1) * root[None, :, None]
+        b = (C[:, k, :].T * root[None, :])[:, :, None]
+        B[:, k, :] = torch.linalg.lstsq(A, b).solution[:, keep, 0].T
+    return B.numpy()
 
 
-def padf_from_clusters(
-    clusters,
-    r: NDArray,
-    theta_deg: NDArray,
-    q: NDArray | None = None,
-    l_max: int = 40,
-    l_taper: bool = False,
-) -> NDArray:
+def _solve_classic(S, l_values, sv_cutoff, n_phi):
     """
-    PADF of atomic models: the angular correlation of all interatomic vectors
-    within each cluster, summed over clusters. Like the diffraction PADF it
-    holds two-, three- and four-body terms (Martin et al. IUCrJ 2017), not
-    only triplets sharing an atom.
-
-    Uses the addition theorem: for each even l < l_max,
-        C_l(r, r') = 2 pi sum_m A_lm(r) conj(A_lm(r')),
-        A_lm(r) = sum over vectors at |d| = r of Y_lm(d / |d|), per unit volume,
-    then Theta = |sin theta| sum_{l >= 2} C_l(r, r') P_l(cos theta), matching
-    reconstruct_PADF (l = 0 is dropped, as the PADF's mean subtraction does).
-
-    Parameters
-    ----------
-    clusters : iterable of (N, 3) arrays
-        Atom positions (Angstroms), one array per cluster.
-    r : (Nr,) array
-        Uniform radial grid (Angstroms); vectors are binned with linear weights.
-    theta_deg : (Ntheta,) array
-        Angles in degrees.
-    q : (Nq,) array or None
-        Measured q values (1/Angstroms, no 2 pi). If given, each C_l is
-        band-limited to them, as bandlimit_volume does.
-    l_max : int
-        Even orders l = 0, 2, ..., < l_max.
-    l_taper : bool
-        Weight each order by order_taper(l, l_max), as reconstruct_PADF does.
-
-    Returns
-    -------
-    (Nr, Nr, Ntheta) array.
+    B_l(q, q') of the original PADF algorithm from the real second moment S
+    (n, k, k'): the angular correlation C(dphi) = S_0 + 2 sum_n S_n cos(n dphi)
+    on n_phi angles, minus its median over angle, is fitted by P_l(cos dphi) for
+    the even orders 0 ... l_max (a flat Ewald sphere) with the weight
+    |sin(dphi)|, by an SVD that drops singular values below sv_cutoff times the
+    largest. Returns the orders l_values.
     """
-    r_t = torch.as_tensor(np.asarray(r), dtype=torch.float64)
+    l_values = np.asarray(l_values)
+    n_k = S.shape[1]
+    n = torch.arange(S.shape[0], dtype=torch.float64)
+    dphi = 2 * np.pi * torch.arange(n_phi, dtype=torch.float64) / n_phi
+    T = torch.cos(dphi[:, None] * n[None, :]) * torch.where(n == 0, 1.0, 2.0)
+    C = torch.einsum("jn,nkp->jkp", T, torch.from_numpy(np.ascontiguousarray(S)))
+    C = C - C.median(dim=0, keepdim=True).values
+    l_fit = np.arange(0, int(l_values[-1]) + 1, 2)
+    w = torch.sqrt(torch.abs(torch.sin(dphi)))
+    A = (
+        torch.special.legendre_polynomial_p(
+            torch.cos(dphi)[:, None], torch.from_numpy(l_fit.astype(np.float64))[None, :]
+        )
+        * w[:, None]
+    )
+    U, s, Vh = torch.linalg.svd(A, full_matrices=False)
+    s_inv = torch.where(s > sv_cutoff * s.max(), 1.0 / s, torch.zeros_like(s))
+    B = Vh.T @ (s_inv[:, None] * (U.T @ (C.reshape(n_phi, -1) * w[:, None])))
+    keep = torch.as_tensor(np.searchsorted(l_fit, l_values))
+    return B.reshape(len(l_fit), n_k, n_k)[keep].numpy()
+
+
+def _legendre_sum(G, l_values, theta_deg, order_taper):
+    """Theta(r, r', theta) = sum_l taper_l G_l(r, r') P_l(cos theta)."""
+    cos_t = torch.cos(torch.deg2rad(torch.as_tensor(theta_deg, dtype=torch.float64)))
+    taper = (
+        _order_taper(l_values, int(l_values[-1]) + 2) if order_taper else np.ones(len(l_values))
+    )
+    out = torch.zeros((G.shape[1], G.shape[2], cos_t.numel()), dtype=torch.float64)
+    for k, ell in enumerate(l_values):
+        out += (
+            float(taper[k])
+            * G[k][:, :, None]
+            * torch.special.legendre_polynomial_p(cos_t, int(ell))[None, None, :]
+        )
+    return out.numpy()
+
+
+def _harmonic_sum(G, n_values, theta_deg, order_taper):
+    """Theta(r, r', dphi) = 2 Re sum_n taper_n G_n(r, r') exp(i n dphi), n >= 1."""
+    phi = torch.deg2rad(torch.as_tensor(theta_deg, dtype=torch.float64))
+    taper = (
+        _order_taper(n_values, int(n_values[-1]) + 1) if order_taper else np.ones(len(n_values))
+    )
+    n_t = torch.from_numpy(n_values.astype(np.float64))
+    E = torch.from_numpy(taper)[:, None] * torch.exp(
+        1j * n_t[:, None] * phi[None, :]
+    )  # (Nn, Ntheta)
+    return (2 * torch.real(torch.einsum("nij,nt->ijt", G, E))).numpy()
+
+
+def _bin_vectors(dist, r):
+    """Linear binning of vector lengths onto the uniform grid r: (index, weight) for both neighbors."""
+    dr = r[1] - r[0]
+    x = (dist - float(r[0])) / dr
+    i0 = torch.floor(x).long()
+    f = x - i0
+    return torch.cat([i0, i0 + 1]), torch.cat([1 - f, f])
+
+
+def _pair_vectors(pos, r_cut, block=1024):
+    """Pair vectors pos_j - pos_i with i < j and 0 < |d| < r_cut, (Npairs, 3)."""
+    n = pos.shape[0]
+    parts = [torch.zeros((0, 3), dtype=pos.dtype)]
+    for start in range(0, n, block):
+        rows = torch.arange(start, min(start + block, n))
+        d = pos[None, :, :] - pos[rows, None, :]
+        dist2 = (d**2).sum(-1)
+        keep = (torch.arange(n)[None, :] > rows[:, None]) & (dist2 > 0) & (dist2 < r_cut**2)
+        parts.append(d[keep])
+    return torch.cat(parts)
+
+
+def _unique_vectors(d, r_cut):
+    """Merge pair vectors that repeat, as in a crystal: (mean, count) of each group."""
+    quantum = r_cut / 2**19  # |d| < r_cut, so each quantized coordinate fits in 21 bits
+    q = torch.round(d / quantum).long() + 2**20
+    key = (q[:, 0] << 42) | (q[:, 1] << 21) | q[:, 2]
+    key, inverse, count = torch.unique(key, return_inverse=True, return_counts=True)
+    mean = torch.zeros((key.numel(), 3), dtype=d.dtype).index_add_(0, inverse, d)
+    return mean / count[:, None], count.to(d.dtype)
+
+
+def _cluster_power_sphere(clusters, r, l_values, memory=2**28, block=2048):
+    """
+    sum_m conj(P_lm(r)) P_lm(r') summed over clusters, P_lm per unit volume, as an
+    (Nl, Nr, Nr) tensor, for even l. Since Y_lm(-v) = Y_lm(v) for even l, each pair
+    adds one vector with twice the weight, and vectors that repeat within a
+    cluster, as in a crystal, are evaluated once and weighted by their count.
+    """
+    l_values = np.asarray(l_values)
+    if np.any(l_values % 2):
+        raise ValueError("the cluster power is computed for even l only")
+    r_t = torch.as_tensor(r, dtype=torch.float64)
+    n_r, r0, r_cut = r.size, float(r_t[0]), float(r_t[-1])
     dr = float(r_t[1] - r_t[0])
-    n_r = r_t.numel()
-    l_values = torch.arange(2, l_max, 2)  # l = 0 is dropped, as the PADF's median subtraction does
-    shell = 4 * np.pi * torch.clamp(r_t, min=0.5 * dr) ** 2 * dr
-    Cl = torch.zeros((len(l_values), n_r, n_r), dtype=torch.float64)
+    shell = torch.clamp(r_t, min=0.5 * dr) ** 2 * dr
+    shell = torch.cat([shell, shell[-1:]])
+    l_max = int(l_values[-1])
+
+    # P_lm = a_lm (x P_l-1,m - b_lm P_l-2,m) for m <= l - 2, P_l,l-1 = sqrt(2l + 1) x P_l-1,l-1,
+    # and P_mm = diag_m sin(beta) P_m-1,m-1
+    ell = torch.arange(l_max + 1, dtype=torch.float64)[:, None]
+    m = torch.arange(l_max + 1, dtype=torch.float64)
+    low = m[None, :] <= ell - 2
+    a = torch.where(low, (4 * ell**2 - 1) / torch.where(low, ell**2 - m**2, 1.0), 0.0).sqrt()
+    b = (
+        torch.where(low, ((ell - 1) ** 2 - m**2) / (4 * (ell - 1) ** 2 - 1), 0.0)
+        .clamp(min=0)
+        .sqrt()
+    )
+    a, b = a[:, :, None].contiguous(), b[:, :, None].contiguous()
+    diag = -torch.sqrt((2 * m[1:] + 1) / (2 * m[1:]))
+    sub = torch.sqrt(2 * m + 1)
+    bounds = np.concatenate([[0], np.cumsum(l_values + 1)])
+    column = {int(e): (int(bounds[k]), int(bounds[k + 1])) for k, e in enumerate(l_values)}
+    m_weight = torch.cat([torch.ones(1), torch.full((l_max,), 2.0)]).to(torch.float64).sqrt()
+    chunk = max(block, memory // (80 * (l_max + 1)))
+
+    H = torch.zeros((len(l_values), n_r, n_r), dtype=torch.float64)
     for pos in clusters:
-        pos = torch.as_tensor(np.asarray(pos), dtype=torch.float64)
-        d = (pos[None, :, :] - pos[:, None, :]).reshape(-1, 3)
+        d = _pair_vectors(torch.as_tensor(np.asarray(pos), dtype=torch.float64), r_cut)
+        d = d[torch.linalg.norm(d, dim=1) >= r0]
+        if d.shape[0] == 0:
+            continue
+        d, count = _unique_vectors(d, r_cut)
         dist = torch.linalg.norm(d, dim=1)
-        keep = (dist > 0) & (dist >= float(r_t[0])) & (dist < float(r_t[-1]))
-        d, dist = d[keep], dist[keep]
-        cos_t = torch.clamp(d[:, 2] / dist, -1, 1)
-        sin_t = torch.sqrt(1 - cos_t**2)
-        phi = torch.atan2(d[:, 1], d[:, 0])
-        # linear binning onto the r grid: each vector split between bins i0 and i0 + 1
-        x = (dist - float(r_t[0])) / dr
+        order = torch.argsort(dist)  # so that each block of vectors covers a short range of r
+        d, count, dist = d[order], count[order], dist[order]
+        x = (dist - r0) / dr
         i0 = torch.floor(x).long()
         f = x - i0
-        index = torch.cat([i0, i0 + 1])
-        weights = torch.cat([1 - f, f]) / torch.cat([shell, shell[-1:]])[index]  # per unit volume
-        cos_t, sin_t, phi = (torch.cat([t, t]) for t in (cos_t, sin_t, phi))
-        Cl += _real_sph_harm_power(cos_t, sin_t, phi, l_values, weights, n_r, index)
-    Cl *= 2 * np.pi
+        w0, w1 = 2 * count * (1 - f) / shell[i0], 2 * count * f / shell[i0 + 1]
+        cos_t = torch.clamp(d[:, 2] / dist, -1, 1)  # polar angle from the beam axis
+        sin_t = torch.sqrt(1 - cos_t**2)
+        phi = torch.atan2(d[:, 0], d[:, 1])
+        A = torch.zeros((2, int(bounds[-1]), n_r + 1), dtype=torch.float64)
+        for s in range(0, dist.numel(), chunk):
+            c = slice(s, s + chunk)
+            n_c = dist[c].numel()
+            # linear binning in r of each block of vectors, as a (vectors, bins) matrix
+            bins = []
+            for t in range(0, n_c, block):
+                i = i0[c][t : t + block]
+                lo = int(i[0])
+                W = torch.zeros((i.numel(), int(i[-1]) + 2 - lo), dtype=torch.float64)
+                rows = torch.arange(i.numel())
+                W[rows, i - lo] = w0[c][t : t + block]
+                W[rows, i + 1 - lo] += w1[c][t : t + block]
+                bins.append((t, lo, W))
+            x_c = cos_t[None, c]
+            p_mm = torch.cumprod(
+                torch.cat(
+                    [
+                        torch.full((1, n_c), (1 / (4 * np.pi)) ** 0.5, dtype=torch.float64),
+                        diag[:, None] * sin_t[None, c],
+                    ]
+                ),
+                0,
+            )  # (M, n)
+            mphi = m[:, None] * phi[None, c]
+            trig = torch.stack([torch.cos(mphi), torch.sin(mphi)])  # (2, M, n)
+            prev2 = prev1 = None
+            for e in range(l_max + 1):
+                cur = torch.empty((e + 1, n_c), dtype=torch.float64)
+                if e >= 2:
+                    body = cur[: e - 1]
+                    torch.mul(prev1[: e - 1], x_c, out=body)
+                    body.addcmul_(prev2, b[e, : e - 1], value=-1.0)
+                    body.mul_(a[e, : e - 1])
+                if e >= 1:
+                    torch.mul(p_mm[e - 1], x_c[0], out=cur[e - 1]).mul_(sub[e])
+                cur[e] = p_mm[e]
+                if e in column:
+                    lo_col, hi_col = column[e]
+                    Y = (cur[None] * trig[:, : e + 1]).reshape(-1, n_c)  # real and imaginary parts
+                    for t, lo, W in bins:
+                        A[:, lo_col:hi_col, lo : lo + W.shape[1]] += (
+                            Y[:, t : t + W.shape[0]] @ W
+                        ).reshape(2, e + 1, -1)
+                prev2, prev1 = prev1, cur
+        for k, e in enumerate(l_values):
+            lo, hi = column[int(e)]
+            Ak = (A[:, lo:hi, :n_r] * m_weight[: e + 1, None]).reshape(-1, n_r)
+            H[k] += Ak.T @ Ak
+    return H
 
-    theta = torch.deg2rad(torch.as_tensor(np.asarray(theta_deg), dtype=torch.float64))
-    out = torch.zeros((n_r, n_r, theta.numel()), dtype=torch.float64)
-    for k, l in enumerate(l_values.tolist()):
-        C = Cl[k] if q is None else _bandlimit_order(Cl[k], l, r, q)
-        if l_taper:
-            C = C * float(order_taper(l, int(l_values[-1]) + 2))  # same as reconstruct_PADF
-        out += C[:, :, None] * torch.special.legendre_polynomial_p(torch.cos(theta), l)[None, None, :]
-    return (out * torch.abs(torch.sin(theta))[None, None, :]).numpy()
+
+def _cluster_power_beam(clusters, r, n_values):
+    """conj(P_n(r)) P_n(r') of the projected positions summed over clusters, P_n per unit area, (Nn, Nr, Nr)."""
+    r_t = torch.as_tensor(r, dtype=torch.float64)
+    dr = float(r_t[1] - r_t[0])
+    ring = 2 * np.pi * torch.clamp(r_t, min=0.5 * dr) * dr
+    ring = torch.cat([ring, ring[-1:]])
+    n_t = torch.as_tensor(n_values, dtype=torch.float64)
+    H = torch.zeros((len(n_values), r.size, r.size), dtype=torch.complex128)
+    for pos in clusters:
+        xy = torch.as_tensor(np.asarray(pos)[:, :2], dtype=torch.float64)
+        d = (xy[None, :, :] - xy[:, None, :]).reshape(-1, 2)
+        dist = torch.hypot(d[:, 0], d[:, 1])
+        keep = (dist > 0) & (dist >= float(r_t[0])) & (dist < float(r_t[-1]))
+        d, dist = d[keep], dist[keep]
+        index, weight = _bin_vectors(dist, r)
+        phi = torch.cat([torch.atan2(d[:, 0], d[:, 1])] * 2)
+        E = (weight / ring[index])[:, None] * torch.exp(
+            -1j * phi[:, None] * n_t[None, :]
+        )  # (Nvec, Nn)
+        A = torch.zeros((r.size + 1, len(n_values)), dtype=torch.complex128).index_add_(
+            0, index, E
+        )[: r.size]
+        H += torch.einsum("in,jn->nij", A.conj(), A)
+    return H
 
 
-def _per_panel(value, n, nested=False):
-    """One entry per panel: a list with one item per panel is used as is,
-    anything else is repeated. With nested=True only a list of lists (or
-    Nones) counts as per panel, so a flat list of marks is shared."""
+def _per_panel(value, n, nested=False, depth=1):
+    """One entry per panel: a list with one item per panel is used as is, anything
+    else is repeated. With nested=True only a list whose items are nested depth
+    levels deep (or None) counts as per panel, so a shared list of marks is not
+    split across panels."""
+
+    def deep(v, d):
+        return d == 0 or (
+            isinstance(v, (list, tuple, np.ndarray)) and all(deep(u, d - 1) for u in v)
+        )
+
     if isinstance(value, (list, tuple)) and len(value) == n:
-        if not nested or all(v is None or isinstance(v, (list, tuple, np.ndarray)) for v in value):
+        if not nested or all(v is None or deep(v, depth) for v in value):
             return list(value)
     return [value] * n
