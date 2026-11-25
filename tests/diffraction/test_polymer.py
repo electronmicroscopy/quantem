@@ -1,11 +1,15 @@
 """Tests for BraggPeaksPolymer: model detection, amorphous-ring calibration, polar peaks."""
 
+import hashlib
+
 import numpy as np
 import pytest
 import torch
 
 from quantem.core.datastructures import Vector
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
+from quantem.core.io.serialize import load
+from quantem.core.ml.cnn import CNN2d
 from quantem.core.utils.utils import electron_wavelength_angstrom
 from quantem.diffraction.bragg_vectors import PEAK_FIELDS
 from quantem.diffraction.calibration import _ellipse_matrix, ellipse_from_axes, q_to_r_matrix
@@ -161,3 +165,26 @@ def test_detect_ice_measures_widths_on_the_patterns():
         len(c)
         for c in (result.filter(bp.peaks)[0, 0].numpy(), result.filter(bp.peaks)[0, 1].numpy())
     ] == [1, 7]
+
+
+def test_save_records_the_model_instead_of_its_weights(tmp_path):
+    model = CNN2d(in_channels=1, out_channels=2, start_filters=4, num_layers=2)
+    weights = tmp_path / "weights.pth"
+    torch.save(model.state_dict(), weights)
+    ds = Dataset4dstem.from_array(np.zeros((2, 2, 16, 16), np.float32))
+    bp = BraggPeaksPolymer.from_dataset(ds, device="cpu").load_model(weights, model=model)
+    info = bp.metadata["model"]
+    assert info["sha256"] == hashlib.sha256(weights.read_bytes()).hexdigest()
+    assert info["architecture"]["start_filters"] == 4
+
+    bp.save(tmp_path / "results.zip")
+    loaded = load(tmp_path / "results.zip")
+    assert loaded.model is None
+    assert loaded.metadata["model"] == info
+    with pytest.raises(RuntimeError, match="weights.pth"):
+        loaded.find_peaks_model()
+
+    bp.save(tmp_path / "with_model.zip", include_model=True)
+    restored = load(tmp_path / "with_model.zip").model
+    for a, b in zip(model.state_dict().values(), restored.state_dict().values()):
+        assert torch.equal(a, b)

@@ -17,6 +17,9 @@ from the amorphous ring, and :meth:`polar_peaks` returns the calibrated peaks as
 
 from __future__ import annotations
 
+import hashlib
+from pathlib import Path
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -56,6 +59,28 @@ def polymer_model() -> CNN2d:
     )
 
 
+def _architecture(model) -> dict:
+    """The constructor settings of a :class:`CNN2d`, or the class name of another network."""
+    arch = {"class": f"{type(model).__module__}.{type(model).__qualname__}"}
+    if isinstance(model, CNN2d):
+        for key, attr in (
+            ("in_channels", "in_channels"),
+            ("out_channels", "out_channels"),
+            ("start_filters", "start_filters"),
+            ("num_layers", "num_layers"),
+            ("num_per_layer", "_num_per_layer"),
+            ("use_skip_connections", "use_skip_connections"),
+            ("use_batchnorm", "_use_batchnorm"),
+            ("dropout", "dropout"),
+            ("activation", "_activation"),
+            ("final_activation", "final_activation"),
+            ("dtype", "dtype"),
+        ):
+            value = getattr(model, attr)
+            arch[key] = value if isinstance(value, (bool, int, float, str)) else str(value)
+    return arch
+
+
 class BraggPeaksPolymer(BraggVectors):
     """Bragg peaks of a polymer 4D-STEM scan, detected with a trained network.
 
@@ -80,6 +105,8 @@ class BraggPeaksPolymer(BraggVectors):
         Global percentiles of the min-max-scaled patterns, fit once per mask.
     """
 
+    model: CNN2d | None = None
+
     def __init__(self, dataset, device=None, _token=None):
         super(BraggPeaksPolymer, self).__init__(dataset, device=device, _token=_token)
         self.model: CNN2d | None = None
@@ -88,12 +115,16 @@ class BraggPeaksPolymer(BraggVectors):
         self.normalization: tuple[float, float] | None = None
         self._normalization_key: np.ndarray | None = None
 
-    def load_model(self, path: str, model: CNN2d | None = None) -> "BraggPeaksPolymer":
+    def load_model(self, path: str | Path, model: CNN2d | None = None) -> "BraggPeaksPolymer":
         """Load network weights, by default into :func:`polymer_model`.
+
+        The weights file's path, SHA-256 and the network's architecture are
+        recorded in ``metadata["model"]``, which :meth:`save` keeps in place of
+        the network.
 
         Parameters
         ----------
-        path : str
+        path : str or Path
             Path to a state dict saved with ``torch.save(model.state_dict(), path)``.
         model : CNN2d, optional
             Network to load the weights into, for a retrained architecture.
@@ -101,7 +132,47 @@ class BraggPeaksPolymer(BraggVectors):
         model = polymer_model() if model is None else model
         model.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
         self.model = model.to(self.device)
+        with open(path, "rb") as f:
+            sha256 = hashlib.file_digest(f, "sha256").hexdigest()
+        self.metadata["model"] = {
+            "path": str(Path(path).resolve()),
+            "sha256": sha256,
+            "architecture": _architecture(model),
+        }
         return self
+
+    def save(
+        self,
+        path,
+        mode="w",
+        store="auto",
+        skip=(),
+        compression_level=4,
+        *,
+        include_dataset: bool = False,
+        include_model: bool = False,
+    ) -> None:
+        """Save the workflow; see :meth:`BraggVectors.save`.
+
+        The network is left out by default. ``metadata["model"]`` records which
+        weights were used; reload them with :meth:`load_model`.
+
+        Parameters
+        ----------
+        include_model : bool, default=False
+            Keep the network's weights in the file.
+        """
+        skip = [skip] if isinstance(skip, (str, type)) else list(skip)
+        if not include_model and "model" not in skip:
+            skip.append("model")
+        super(BraggPeaksPolymer, self).save(
+            path,
+            mode=mode,
+            store=store,
+            skip=skip,
+            compression_level=compression_level,
+            include_dataset=include_dataset,
+        )
 
     def find_peaks_model(
         self,
@@ -151,7 +222,9 @@ class BraggPeaksPolymer(BraggVectors):
             shape ``(scan_row, scan_col)``, or ``(len(positions),)``.
         """
         if self.model is None:
-            raise RuntimeError("Load the network weights first with load_model().")
+            used = self.metadata.get("model", {}).get("path")
+            hint = f" These results used {used}." if used else ""
+            raise RuntimeError(f"Load the network weights first with load_model().{hint}")
         scan_r, scan_c = int(self.dataset.shape[0]), int(self.dataset.shape[1])
         if scan_mask is not None:
             self.scan_mask = np.asarray(scan_mask, dtype=bool)
