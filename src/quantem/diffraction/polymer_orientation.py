@@ -20,9 +20,8 @@ from __future__ import annotations
 
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
-import torch.nn.functional as F
 from matplotlib.colors import hsv_to_rgb, rgb_to_hsv
+from scipy.ndimage import gaussian_filter1d
 from scipy.signal import find_peaks, peak_widths
 from tqdm.auto import tqdm
 
@@ -123,7 +122,7 @@ def estimate_peak_windows(
     if log_scale:
         profile = np.log1p(profile)
     if smoothing_sigma > 0:
-        profile = _gaussian_1d(profile, smoothing_sigma, axis=0)
+        profile = gaussian_filter1d(profile, smoothing_sigma, axis=0)
     dq = q[1] - q[0]
     found, props = find_peaks(
         profile,
@@ -301,12 +300,13 @@ def make_orientation_histogram(
     for k, (lo, hi) in enumerate(ranges):
         sel = (data[:, 0] ** 2 >= lo**2) & (data[:, 0] ** 2 < hi**2)
         _splat(hist[k], x[sel], y[sel], t[sel], data[sel, 2])
-    if sigma_x:
-        hist = _gaussian_1d(hist, sigma_x * upsample_factor, axis=1, mode="nearest", truncate=3.0)
-    if sigma_y:
-        hist = _gaussian_1d(hist, sigma_y * upsample_factor, axis=2, mode="nearest", truncate=3.0)
-    if sigma_theta:
-        hist = _gaussian_1d(hist, sigma_theta / theta_step_deg, axis=3, mode="wrap", truncate=2.0)
+    for sigma, axis, mode, truncate in (
+        (sigma_x * upsample_factor, 1, "nearest", 3.0),
+        (sigma_y * upsample_factor, 2, "nearest", 3.0),
+        (sigma_theta / theta_step_deg, 3, "wrap", 2.0),
+    ):
+        if sigma:
+            gaussian_filter1d(hist, sigma, axis, mode=mode, truncate=truncate, output=hist)
     if normalize == "stack" and hist.max() > 0:
         hist /= hist.max()
     elif normalize == "image":
@@ -430,8 +430,8 @@ def make_flowline_map(
     flow *= step_size
     if linewidth > 1.0:
         s = linewidth - 1.0
-        flow = _gaussian_1d(flow, s, axis=1, truncate=3.0)
-        flow = _gaussian_1d(flow, s, axis=2, truncate=3.0) * s**2
+        flow = gaussian_filter1d(flow, s, axis=1, truncate=3.0)
+        flow = gaussian_filter1d(flow, s, axis=2, truncate=3.0) * s**2
     return flow
 
 
@@ -601,20 +601,6 @@ def _show_rgb(images):
         ax.imshow(im)
         ax.axis("off")
     return fig, axes
-
-
-_PAD_MODES = {"nearest": "edge", "wrap": "wrap", "reflect": "symmetric"}
-
-
-def _gaussian_1d(array, sigma, axis, mode="reflect", truncate=4.0):
-    """Gaussian filter along one axis, as ``scipy.ndimage.gaussian_filter1d``."""
-    radius = int(truncate * sigma + 0.5)
-    x = torch.as_tensor(np.moveaxis(np.asarray(array, dtype=np.float64), axis, -1))
-    shape = x.shape
-    index = np.pad(np.arange(shape[-1]), radius, mode=_PAD_MODES[mode])
-    k = torch.exp(-0.5 * (torch.arange(-radius, radius + 1, dtype=x.dtype) / sigma) ** 2)
-    x = F.conv1d(x.reshape(-1, 1, shape[-1])[..., index], (k / k.sum()).view(1, 1, -1))
-    return np.moveaxis(x.reshape(shape).numpy(), -1, axis)
 
 
 def _splat(hist, x, y, t, weight):
