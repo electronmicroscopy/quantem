@@ -72,8 +72,9 @@ def calculate_orientation_correlation(
     radius_max: int | None = None,
     pairs: str | Sequence[tuple[int, int]] = "all",
     device=None,
-    mode_batch_size: int = 8,
+    mode_batch_size: int | None = None,
     pair_batch_size: int = 4,
+    max_memory_fraction: float = 0.6,
     dtype: str = "float32",
     zero_policy: str = "nan",
     return_numpy: bool = True,
@@ -95,9 +96,14 @@ def calculate_orientation_correlation(
     pairs : {"all", "autocorrelation"} or sequence of (int, int)
         Radial-bin pairs; ``"all"`` uses upper-triangular ordering.
     device : str or torch.device, optional
-        Defaults to the input tensor's device, else CPU.
-    mode_batch_size, pair_batch_size : int
-        Angular modes and radial-bin pairs per batch.
+        Defaults to the input tensor's device, else CUDA if available, else CPU.
+    mode_batch_size : int, optional
+        Angular modes per batch. Defaults on CUDA to as many as fit in
+        ``max_memory_fraction`` of the free GPU memory, and to 8 on CPU.
+    pair_batch_size : int, default=4
+        Radial-bin pairs per batch.
+    max_memory_fraction : float, default=0.6
+        Fraction of the free GPU memory the default ``mode_batch_size`` may use.
     dtype : {"float32", "float64"}
     zero_policy : {"nan", "zero", "raise"}
         Handling of distances with no normalization signal.
@@ -115,10 +121,15 @@ def calculate_orientation_correlation(
         raise ValueError("dtype must be 'float32' or 'float64'")
     if zero_policy not in ("nan", "zero", "raise"):
         raise ValueError("zero_policy must be 'nan', 'zero', or 'raise'")
-    if mode_batch_size < 1 or pair_batch_size < 1:
+    if (mode_batch_size is not None and mode_batch_size < 1) or pair_batch_size < 1:
         raise ValueError("mode_batch_size and pair_batch_size must be at least 1")
+    if not 0 < max_memory_fraction <= 1:
+        raise ValueError("max_memory_fraction must be in (0, 1]")
     if device is None:
-        device = orient_hist.device if isinstance(orient_hist, torch.Tensor) else "cpu"
+        if isinstance(orient_hist, torch.Tensor):
+            device = orient_hist.device
+        else:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
     real_dtype = getattr(torch, dtype)
     histogram = torch.as_tensor(orient_hist, dtype=real_dtype, device=device)
     device = histogram.device
@@ -145,6 +156,20 @@ def calculate_orientation_correlation(
     num_pairs, num_modes = len(pair_indices), num_theta // 2 + 1
     theta_spectrum = torch.fft.rfft(histogram, dim=-1)
     spectrum = theta_spectrum.new_zeros((num_pairs, num_modes, radius_max + 1))
+    if mode_batch_size is None:
+        if device.type == "cuda":
+            # padded 2D spectra per mode: the FFT input, output and workspace of
+            # every radial bin, and the copies made for each pair of a batch
+            bytes_per_mode = (
+                shape[0]
+                * shape[1]
+                * theta_spectrum.element_size()
+                * (3 * num_radii + 3 * min(pair_batch_size, num_pairs) + 2)
+            )
+            budget = int(_free_cuda_bytes(device) * max_memory_fraction)
+            mode_batch_size = _modes_that_fit(budget, bytes_per_mode, num_modes)
+        else:
+            mode_batch_size = 8
     num_batches = -(-num_modes // mode_batch_size) * -(-num_pairs // pair_batch_size)
     desc = f"Calculate orientation correlations ({device})"
     with tqdm(total=num_batches, desc=desc, unit="batch", disable=not progress_bar) as progress:
@@ -170,6 +195,27 @@ def calculate_orientation_correlation(
     if return_numpy:
         correlation = correlation.cpu().numpy()
     return correlation, pair_indices
+
+
+def _free_cuda_bytes(device) -> int:
+    """GPU memory this process can still allocate, including blocks it has cached."""
+    free, total = torch.cuda.mem_get_info(device)
+    free += torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+    fraction = torch.cuda.get_per_process_memory_fraction(device)
+    if fraction < 1:
+        free = min(free, int(fraction * total) - torch.cuda.memory_allocated(device))
+    return max(int(free), 0)
+
+
+def _modes_that_fit(budget: int, bytes_per_mode: int, num_modes: int) -> int:
+    """Angular modes per batch that fit in ``budget`` bytes, at most ``num_modes``."""
+    if bytes_per_mode > budget:
+        raise MemoryError(
+            f"One angular mode needs {bytes_per_mode / 1024**3:.2f} GiB but the GPU budget "
+            f"is {budget / 1024**3:.2f} GiB. Raise max_memory_fraction, lower "
+            "pair_batch_size or radius_max, or use a coarser orientation histogram."
+        )
+    return min(budget // bytes_per_mode, num_modes)
 
 
 def _crossing(coordinates, profile, level):

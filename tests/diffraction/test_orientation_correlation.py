@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from quantem.diffraction.orientation_correlation import (
+    _modes_that_fit,
     calculate_orientation_correlation,
     orientation_correlation_metrics,
 )
@@ -49,6 +50,13 @@ def test_zero_signal_policy():
     np.testing.assert_array_equal(zero, 0)
     with pytest.raises(ZeroDivisionError):
         calculate_orientation_correlation(empty, zero_policy="raise", progress_bar=False)
+
+
+def test_modes_that_fit_memory_budget():
+    for budget, expected in ((100, 3), (1000, 10)):
+        assert _modes_that_fit(budget, bytes_per_mode=30, num_modes=10) == expected, budget
+    with pytest.raises(MemoryError, match="max_memory_fraction"):
+        _modes_that_fit(20, bytes_per_mode=30, num_modes=10)
 
 
 def _linear_panel(slope, num_distances=21):
