@@ -438,7 +438,7 @@ class BraggPeaksPolymer(BraggVectors):
             polar,
             self.peaks,
             fields=["q", "theta", "intensity"],
-            units=["A^-1", "rad", "counts"],
+            units=["A^-1", "rad", "a.u."],
             name="polar_peaks",
         )
         out.metadata.update({k: v for k, v in self.peaks.metadata.items() if "scan" in k})
