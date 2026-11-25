@@ -1,5 +1,6 @@
 """Tests for radial peak windows, orientation histograms and flowlines."""
 
+import matplotlib.pyplot as plt
 import numpy as np
 
 from quantem.core.datastructures import Vector
@@ -7,6 +8,7 @@ from quantem.diffraction.polymer_orientation import (
     estimate_peak_windows,
     make_flowline_map,
     make_orientation_histogram,
+    peak_maps,
 )
 
 
@@ -48,6 +50,17 @@ def test_orientation_histogram_places_and_folds_peaks():
     assert np.isclose((rows * weight[rows, cols]).sum() / 2.0, 5.5)
     assert np.isclose((cols * weight[rows, cols]).sum() / 2.0, 9.5)
     assert np.isclose(hist[0, ..., 30].sum(), 2.0)
+
+
+def test_count_maps_show_every_integer_count():
+    cells = {(0, 0): np.full((7, 3), 0.25), (1, 1): np.full((1, 3), 0.25)}
+    maps = peak_maps(_peaks(cells, (3, 3)), [[0.2, 0.3]], plot=True)
+    assert maps[0].max() == 7
+    cbar_ax = plt.gcf().axes[1]
+    # the full range, one colour per count
+    assert cbar_ax.get_ylim() == (-0.5, 7.5)
+    assert cbar_ax._colorbar.cmap.N == 8
+    plt.close("all")
 
 
 def _field(theta, value, num_theta=90):

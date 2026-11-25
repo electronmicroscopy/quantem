@@ -247,6 +247,14 @@ def peak_maps(peaks: Vector, q_ranges=None, mode="count", min_intensity=None, pl
         titles = (
             [f"q {lo:.2f}-{hi:.2f} 1/A" for lo, hi in ranges] if q_ranges is not None else None
         )
+        if mode == "count":
+            # one colour per integer count over the full range
+            cmap = plt.get_cmap(kwargs.pop("cmap", "viridis"))
+            kwargs["cmap"] = [cmap.resampled(int(m.max()) + 1) for m in maps]
+            kwargs.setdefault(
+                "norm",
+                [{"interval_type": "manual", "vmin": -0.5, "vmax": m.max() + 0.5} for m in maps],
+            )
         show_2d(list(maps), title=titles, cbar=True, **kwargs)
     return maps
 
