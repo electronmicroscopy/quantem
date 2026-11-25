@@ -285,6 +285,51 @@ class BraggPeaksPolymer(BraggVectors):
         self.compute_bvm()
         return peaks
 
+    def save_peak_figures(self, ry: int, rx: int, intensity_map=None, **kwargs) -> list[Path]:
+        """Save the scan map, the pattern and its polar transform at one position, with the peaks.
+
+        See :func:`~quantem.diffraction.polymer_visualization.save_peak_figures` for
+        the figures and the styling options.
+
+        Parameters
+        ----------
+        ry, rx : int
+            Scan position.
+        intensity_map : ndarray, optional
+            Scan image to mark the position on, e.g. a flowline image; defaults to
+            the number of peaks at each position.
+        **kwargs
+            Passed to :func:`~quantem.diffraction.polymer_visualization.save_peak_figures`.
+
+        Returns
+        -------
+        list of Path
+            The files written.
+        """
+        from quantem.diffraction.polymer_visualization import save_peak_figures
+
+        if self.peaks is None:
+            raise RuntimeError("Run find_peaks_model() first.")
+        scan_shape = tuple(int(n) for n in self.peaks.shape)
+        if not (0 <= ry < scan_shape[0] and 0 <= rx < scan_shape[1]):
+            raise ValueError(f"Position ({ry}, {rx}) is outside the scan {scan_shape}.")
+        if self.origins is None:
+            self.origins = self.find_origins()
+        if intensity_map is None:
+            intensity_map = np.asarray(self.peaks.row_counts()).reshape(scan_shape)
+        peaks = self.peaks[ry, rx].numpy().astype(np.float64).reshape(-1, 3)
+        return save_peak_figures(
+            np.asarray(self.dataset.array[ry, rx], dtype=np.float64),
+            peaks[:, :2],
+            peaks[:, 2],
+            self.origins[ry, rx],
+            (ry, rx),
+            intensity_map,
+            scan_shape,
+            ellipse=None if self.calibration is None else self.calibration.ellipse,
+            **kwargs,
+        )
+
     def show_detection(
         self,
         positions=None,

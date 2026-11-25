@@ -194,3 +194,48 @@ def test_save_records_the_model_instead_of_its_weights(tmp_path):
     restored = load(tmp_path / "with_model.zip").model
     for a, b in zip(model.state_dict().values(), restored.state_dict().values()):
         assert torch.equal(a, b)
+
+
+def test_save_peak_figures_marks_the_peaks_on_the_polar_transform(tmp_path):
+    from quantem.diffraction.polar_transform import polar_transform
+    from quantem.diffraction.polymer_visualization import _ellipse_axes, _polar_coords
+
+    origin, ellipse = np.array([40.3, 38.7]), ellipse_from_axes(1.1, 0.9, 25.0)
+    rows, cols = np.mgrid[:80, :80].astype(float)
+    spot = origin + np.array([-12.0, 20.0])
+    partner = 2 * origin - spot  # dimmer Friedel partner, what the two-fold panel samples
+    dp = sum(
+        w * np.exp(-((rows - r) ** 2 + (cols - c) ** 2) / 2.0)
+        for w, (r, c) in ((1.0, spot), (0.8, partner))
+    )
+    axes = _ellipse_axes(ellipse)
+    assert np.allclose(ellipse_from_axes(*axes), ellipse)
+
+    # the overlay lands on the brightest sample of polar_transform
+    for two_fold, period in ((False, 360.0), (True, 180.0)):
+        polar = polar_transform(
+            Dataset4dstem.from_array(dp[None, None].astype(np.float32)),
+            origin_array=origin,
+            ellipse_params=axes,
+            num_annular_bins=360,
+            two_fold_rotation_symmetry=two_fold,
+            scan_pos=(0, 0),
+        ).numpy()
+        row, col = np.unravel_index(np.argmax(polar), polar.shape)
+        radius, phi = _polar_coords((spot - origin)[None], axes)
+        assert abs(col - radius[0]) <= 1.0
+        assert abs(row * period / 360 - np.mod(np.rad2deg(phi[0]), period)) <= 1.0
+
+    ds = Dataset4dstem.from_array(np.tile(dp, (2, 3, 1, 1)).astype(np.float32))
+    bp = BraggPeaksPolymer.from_dataset(ds, device="cpu")
+    cell = np.array([[*origin, 5.0], [*spot, 1.0]])
+    bp.peaks = Vector.from_data([[cell] * 3] * 2, fields=PEAK_FIELDS, name="p")
+    bp.origins = np.broadcast_to(origin, (2, 3, 2)).copy()
+    flowlines = np.zeros((8, 12, 3))  # an RGB map upsampled 4x
+    paths = bp.save_peak_figures(1, 2, intensity_map=flowlines, save_dir=tmp_path, zoom=2.0)
+    assert [p.name for p in paths] == [
+        f"peaks_ry1_rx2_{name}.pdf" for name in ("intensity_map", "diffraction", "polar")
+    ]
+    assert all(p.stat().st_size > 0 for p in paths)
+    with pytest.raises(ValueError, match="multiple of the scan"):
+        bp.save_peak_figures(0, 0, intensity_map=np.zeros((5, 5)), save_dir=tmp_path)
