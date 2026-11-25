@@ -280,8 +280,8 @@ def test_self_term_removal(triangular):
             assert lo < BOND < hi < 0.5 * (1 + np.sqrt(3)) * BOND, (lo, hi)
 
 
-def test_classic_method():
-    """The classic method of bcc Fe cluster patterns matches its model, processed
+def test_martin_method():
+    """The Martin PADF of bcc Fe cluster patterns matches its model, processed
     the same way, at r = r' = the first shell, with peaks at the bond angles."""
     fe = bulk("Fe", "bcc", a=2.87, cubic=True) * (8, 8, 8)
     ds = cluster_patterns(fe, 200, n_px=96, q_max=3.5, r_cluster=6.0, blur_px=0.0, seed=0)
@@ -289,8 +289,8 @@ def test_classic_method():
         ds, fq=lambda q: compute_WK_factor(q, 26, 200e3).real, k_min=0.1
     )
     with pytest.raises(ValueError, match="sphere model only"):
-        padf.correlation("beam", method="classic")
-    theta, T = padf.correlation("sphere", method="classic", l_max=30, r_max=4.0)
+        padf.correlation("beam", method="martin")
+    theta, T = padf.correlation("sphere", method="martin", l_max=30, r_max=4.0)
     assert padf.Theta_self is None
     M = padf.model_correlation([pos for pos, _ in random_clusters(fe, 100, 6.0, seed=1)])
     i = int(np.argmin(np.abs(padf.r - 2.485)))

@@ -69,7 +69,7 @@ cluster diameter, far above l_max; with this weight they do not fold into the
 fitted orders. The output is a density per unit volume squared and per unit
 cos(theta), so it carries no |sin(theta)| factor.
 
-correlation(method="classic") instead follows the original PADF algorithm
+correlation(method="martin") instead follows the original PADF algorithm
 (Martin, IUCrJ 4, 24 (2017); pypadf), as rewritten in quantem by K. Ehrhardt:
 the angular correlation of the rings on a flat Ewald sphere, minus its median
 over angle, is inverted for the even orders l <= l_max by a truncated SVD with
@@ -332,19 +332,19 @@ class PairAngleDistributionFunction:
         model : "sphere" (3D, theta from 0 to 180 deg) or "beam" (projected,
             dphi from 0 to 360 deg); see the module docstring.
         method : "moments", the solid-angle fit of the second moments with the
-            self term removed; or "classic", the original PADF algorithm (see the
-            module docstring), for the sphere model only. The classic Theta holds
+            self term removed; or "martin", the original PADF algorithm of Martin et al. (see
+            the module docstring), for the sphere model only. Its Theta holds
             the self term and a |sin(theta)| factor, and Theta_self is None.
         part : "total", "mean" or "fluctuation" second moment; by default
             "fluctuation" for the sphere model and "total" for the beam model,
             which is often applied to single patterns, for a single pattern,
-            whose fluctuation part is zero, and for the classic method.
+            whose fluctuation part is zero, and for the Martin PADF.
         l_max : largest (even) spherical harmonic order, for the sphere model.
         n_max : largest circular harmonic order, for the beam model.
         r_max, r_step : real-space grid (A), including r_max.
         order_taper : weight the orders by a cos^2 taper to zero just past the
             largest order, which suppresses ringing in theta.
-        sv_cutoff : for the classic method, singular values below this fraction
+        sv_cutoff : for the Martin PADF, singular values below this fraction
             of the largest are left out of the inversion.
 
         Returns theta_deg (Ntheta,) and Theta (Nr, Nr, Ntheta), the correlation
@@ -356,20 +356,20 @@ class PairAngleDistributionFunction:
         amplitude, which follows the pair distribution, in self_amplitude as
         (u, h).
         """
-        if method not in ("moments", "classic"):
-            raise ValueError(f"method must be 'moments' or 'classic', got {method!r}")
-        if method == "classic" and model != "sphere":
-            raise ValueError("the classic method is defined for the sphere model only")
+        if method not in ("moments", "martin"):
+            raise ValueError(f"method must be 'moments' or 'martin', got {method!r}")
+        if method == "martin" and model != "sphere":
+            raise ValueError("the Martin PADF is defined for the sphere model only")
         if part is None:
             moments_sphere = model == "sphere" and method == "moments"
             part = "fluctuation" if moments_sphere and self.n_patterns > 1 else "total"
         self.r = np.arange(0, r_max + 0.5 * r_step, r_step)
         self.model, self.method, self.part, self.order_taper = model, method, part, order_taper
         S = self._part(part)
-        if method == "classic":
+        if method == "martin":
             self.l_values = np.arange(2, l_max + 1, 2)
-            self.B = _solve_classic(S.real, self.l_values, sv_cutoff, self.n_phi)
-            G = self._real_space_classic(self.B)
+            self.B = _solve_martin(S.real, self.l_values, sv_cutoff, self.n_phi)
+            G = self._real_space_martin(self.B)
             self.G, self.G_self, self.G0_self, self.self_amplitude = G.numpy(), None, None, None
             self.theta_deg, self.Theta = self._angular_sum(G)
             self.Theta_self = None
@@ -396,7 +396,7 @@ class PairAngleDistributionFunction:
         if self.model == "sphere":
             theta = np.arange(0, 181, 1.0)
             out = _legendre_sum(G, self.l_values, theta, self.order_taper)
-            if self.method == "classic":  # per unit theta rather than per unit cos(theta)
+            if self.method == "martin":  # per unit theta rather than per unit cos(theta)
                 out = out * np.abs(np.sin(np.deg2rad(theta)))[None, None, :]
         else:
             theta = np.arange(0, 361, 1.0)
@@ -467,8 +467,8 @@ class PairAngleDistributionFunction:
         w = self.q_perp * self.dq_perp * self.weight
         return torch.from_numpy(jv(n, 2 * np.pi * np.outer(r, self.q_perp)) * w[None, :])
 
-    def _kernel_classic(self, ell):
-        """(Nr, Nk) spherical Bessel transform of the classic method: the q range
+    def _kernel_martin(self, ell):
+        """(Nr, Nk) spherical Bessel transform of the Martin PADF: the q range
         [k_min, k_max] with a hard edge, no damping, and the measure
         (q / q_max)^2 d(q / q_max), which keeps the output dimensionless."""
         inside = (self.q >= self.k_min) & (self.q <= self.k_max)
@@ -478,10 +478,10 @@ class PairAngleDistributionFunction:
             spherical_jn(ell, 2 * np.pi * np.outer(self.r, self.q)) * w[None, :]
         )
 
-    def _real_space_classic(self, B):
+    def _real_space_martin(self, B):
         G = torch.zeros((len(self.l_values), self.r.size, self.r.size), dtype=torch.float64)
         for k, ell in enumerate(self.l_values):
-            K = self._kernel_classic(int(ell))
+            K = self._kernel_martin(int(ell))
             G[k] = 2 * np.pi * K @ torch.from_numpy(np.ascontiguousarray(B[k])) @ K.T
         return G
 
@@ -561,15 +561,15 @@ class PairAngleDistributionFunction:
                     * (r_model**2 * dr)[None, :]
                 )
                 B = 4 * np.pi * Kr @ H[k] @ Kr.T  # band-limited to the measured q
-                if self.method == "classic":
-                    K = self._kernel_classic(int(ell))
+                if self.method == "martin":
+                    K = self._kernel_martin(int(ell))
                     G[k] = 2 * np.pi * K @ B @ K.T
                 else:
                     K = self._kernel_sphere(int(ell))
                     G[k] = 2 * np.pi * (4 * np.pi) ** 3 * K @ B @ K.T
-            if self.method == "classic":
+            if self.method == "martin":
                 if return_self:
-                    raise ValueError("the classic method has no self term")
+                    raise ValueError("the Martin PADF has no self term")
                 return self._angular_sum(G)[1]
             return self._model_output(G, return_self)
         H = _cluster_power_beam(clusters, r_model, self.n_values)
@@ -1123,7 +1123,7 @@ def _solve_sphere(S, beta, l_values):
     return B.numpy()
 
 
-def _solve_classic(S, l_values, sv_cutoff, n_phi):
+def _solve_martin(S, l_values, sv_cutoff, n_phi):
     """
     B_l(q, q') of the original PADF algorithm from the real second moment S
     (n, k, k'): the angular correlation C(dphi) = S_0 + 2 sum_n S_n cos(n dphi)
