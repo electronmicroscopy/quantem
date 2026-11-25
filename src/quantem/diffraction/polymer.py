@@ -267,7 +267,7 @@ class BraggPeaksPolymer(BraggVectors):
 
         Each pattern's center is found by
         :func:`~quantem.diffraction.polar_transform.find_origin_angular_descent`,
-        which minimizes the intensity variance around rings centred on it. It
+        which minimizes the intensity variance around rings centered on it. It
         uses the whole pattern, so it holds where the direct beam is weak or
         saturated, and gives each pattern its own origin with no plane fit over
         the scan. :meth:`measure_origins` (brightest peak near the center, then a

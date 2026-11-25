@@ -248,7 +248,7 @@ def peak_maps(peaks: Vector, q_ranges=None, mode="count", min_intensity=None, pl
             [f"q {lo:.2f}-{hi:.2f} 1/A" for lo, hi in ranges] if q_ranges is not None else None
         )
         if mode == "count":
-            # one colour per integer count over the full range
+            # one color per integer count over the full range
             cmap = plt.get_cmap(kwargs.pop("cmap", "viridis"))
             kwargs["cmap"] = [cmap.resampled(int(m.max()) + 1) for m in maps]
             kwargs.setdefault(
@@ -471,21 +471,21 @@ def make_flowline_rainbow_image(
     sum_radial_bins=False,
     plot_images=True,
 ):
-    """RGB image of the flowlines, coloured by orientation.
+    """RGB image of the flowlines, colored by orientation.
 
     Parameters
     ----------
     orient_flowlines : np.ndarray
         Output of :func:`make_flowline_map`.
     int_range : (float, float)
-        Flowline intensity mapped to black and full colour.
+        Flowline intensity mapped to black and full color.
     sym_rotation_order : int
-        Rotational symmetry of the colouring.
+        Rotational symmetry of the coloring.
     theta_offset : float or array
-        Rotation of the colour wheel in radians, per window if an array. The
-        default pi colours horizontal lines red and vertical lines cyan.
+        Rotation of the color wheel in radians, per window if an array. The
+        default pi colors horizontal lines red and vertical lines cyan.
     greyscale : bool
-        Grey levels instead of colour, from the max (``greyscale_max``) or mean
+        Gray levels instead of color, from the max (``greyscale_max``) or mean
         over theta.
     white_background : bool
         Invert the background to white.
@@ -534,16 +534,16 @@ def make_flowline_combined_image(
     sum_radial_bins=True,
     plot_images=True,
 ):
-    """RGB image of the flowlines with one colour per radial window.
+    """RGB image of the flowlines with one color per radial window.
 
     Parameters
     ----------
     orient_flowlines : np.ndarray
         Output of :func:`make_flowline_map`.
     int_range : (float, float)
-        Flowline intensity (summed over theta) mapped to black and full colour.
+        Flowline intensity (summed over theta) mapped to black and full color.
     cvals : array
-        ``(n, 3)`` RGB colour of each window.
+        ``(n, 3)`` RGB color of each window.
     white_background, power_scaling, sum_radial_bins, plot_images
         As in :func:`make_flowline_rainbow_image`.
     """
@@ -566,8 +566,8 @@ def make_flowline_rainbow_legend(
 ):
     """Colour wheel for :func:`make_flowline_rainbow_image`.
 
-    Each direction on the ring has the colour of a flowline running that way,
-    computed with the same colour function as the image.
+    Each direction on the ring has the color of a flowline running that way,
+    computed with the same color function as the image.
 
     Returns
     -------

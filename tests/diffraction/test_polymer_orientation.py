@@ -57,7 +57,7 @@ def test_count_maps_show_every_integer_count():
     maps = peak_maps(_peaks(cells, (3, 3)), [[0.2, 0.3]], plot=True)
     assert maps[0].max() == 7
     cbar_ax = plt.gcf().axes[1]
-    # the full range, one colour per count
+    # the full range, one color per count
     assert cbar_ax.get_ylim() == (-0.5, 7.5)
     assert cbar_ax._colorbar.cmap.N == 8
     plt.close("all")
