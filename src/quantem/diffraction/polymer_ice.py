@@ -19,13 +19,17 @@ Up to ``max_crystallites`` lattices are peeled from each pattern, strongest firs
 from __future__ import annotations
 
 import copy
+import dataclasses
 import math
 import warnings
 from dataclasses import dataclass
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
+from matplotlib.colors import LogNorm
+from matplotlib.patches import Rectangle
 from numpy.lib.stride_tricks import sliding_window_view
 from numpy.typing import NDArray
 
@@ -303,13 +307,7 @@ def detect_ice(
         sharp &= data[:, fields.index("width_q")] <= p.max_width_q_invA
     if p.max_width_theta_deg is not None:
         sharp &= np.rad2deg(data[:, fields.index("width_theta")]) <= p.max_width_theta_deg
-    if p.intensity_cutoff is not None:
-        threshold = float(p.intensity_cutoff)
-    else:
-        values = intensity[analysed & np.isfinite(intensity)]
-        threshold = (
-            float(np.percentile(values, p.intensity_percentile_global)) if values.size else np.inf
-        )
+    threshold = _intensity_threshold(intensity[analysed], p)
     candidate = sharp & (intensity >= threshold)
     n_candidates = np.bincount(cell_of_row[candidate], minlength=len(counts))
 
@@ -346,6 +344,14 @@ def detect_ice(
     )
     flagged = np.bincount(cell_of_row[flags], minlength=len(counts)).reshape(shape)
     return IceDetectionResult(mask, flagged, arms.reshape(shape), threshold, debug)
+
+
+def _intensity_threshold(intensity, p):
+    """``intensity_cutoff``, or the ``intensity_percentile_global`` percentile of ``intensity``."""
+    if p.intensity_cutoff is not None:
+        return float(p.intensity_cutoff)
+    values = intensity[np.isfinite(intensity)]
+    return float(np.percentile(values, p.intensity_percentile_global)) if values.size else np.inf
 
 
 def _fit_lattices(theta, sharp, candidate, p):
@@ -467,3 +473,302 @@ def _from_flat(rows, counts, shape, **kwargs) -> Vector:
 
 
 __all__ = ["IceDetectionResult", "IceFlaggerParams", "detect_ice", "measure_peak_widths"]
+
+
+# ---- figures ----
+
+
+def _analyzed_rows(peaks, scan_mask):
+    """Per-peak flag: the peak's scan position is in ``scan_mask``."""
+    if scan_mask is None:
+        return np.ones(int(np.sum(peaks.row_counts())), bool)
+    return np.repeat(np.asarray(scan_mask, bool).ravel(), peaks.row_counts())
+
+
+def plot_q_intensity_density(
+    peaks: Vector,
+    params: IceFlaggerParams | None = None,
+    scan_mask: NDArray[np.bool_] | None = None,
+    q_range=None,
+    q_bins: int = 200,
+    i_bins: int = 200,
+    color: str = "cyan",
+):
+    """Density of peaks in (q, intensity), with the ice q window and intensity threshold.
+
+    Use it to choose ``intensity_cutoff``: ice reflections stand out as bright
+    peaks at ``q_target_invA``.
+
+    Parameters
+    ----------
+    peaks : Vector
+        Polar peaks with fields ``(q, theta, intensity)``.
+    params : IceFlaggerParams, optional
+        The q window and intensity threshold to draw.
+    scan_mask : ndarray of bool, optional
+        Scan positions to include, as in :func:`detect_ice`.
+    q_range : (float, float), optional
+        q axis limits in 1/Angstrom; defaults to zero up to the largest peak q or
+        the window edge.
+    q_bins, i_bins : int
+        Histogram bins along q and intensity.
+    color : str
+        Color of the window and threshold.
+
+    Returns
+    -------
+    fig, ax
+    """
+    p = IceFlaggerParams() if params is None else params
+    data = peaks.select_fields(["q", "intensity"]).numpy().astype(np.float64)
+    data = data[_analyzed_rows(peaks, scan_mask) & np.isfinite(data).all(1)]
+    if len(data) == 0:
+        raise ValueError("No peaks with finite q and intensity to plot.")
+    q, intensity = data[:, 0], data[:, 1]
+    threshold = _intensity_threshold(intensity, p)
+    i_max = max(1.0, float(intensity.max()))
+    if q_range is None:
+        q_range = (0.0, max(float(q.max()), p.q_target_invA + p.dq_invA))
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    hist = ax.hist2d(
+        q,
+        intensity,
+        bins=(q_bins, i_bins),
+        range=(q_range, (0, i_max)),
+        norm=LogNorm(),
+        cmap="magma",
+    )
+    fig.colorbar(hist[3], ax=ax, label="peaks (log scale)")
+    ax.add_patch(
+        Rectangle(
+            (p.q_target_invA - p.dq_invA, threshold),
+            2 * p.dq_invA,
+            i_max - threshold,
+            facecolor=color,
+            edgecolor=color,
+            alpha=0.18,
+        )
+    )
+    ax.axvline(p.q_target_invA, color=color, ls=":", lw=2)
+    ax.axhline(threshold, color=color, ls="--", lw=2)
+    ax.text(q_range[0], threshold, f" threshold {threshold:.3g}", color=color, va="bottom")
+    ax.set(xlabel="q (1/Å)", ylabel="intensity", xlim=q_range, ylim=(0, i_max))
+    fig.tight_layout()
+    return fig, ax
+
+
+def selection_box(
+    peaks: Vector,
+    params: IceFlaggerParams | None = None,
+    max_width_q_invA: float | None = None,
+    max_width_theta_deg: float | None = None,
+    scan_mask: NDArray[np.bool_] | None = None,
+    fig_path=None,
+) -> IceFlaggerParams:
+    """Show which q-window peaks pass the sharpness and intensity gates, and return the params.
+
+    The width ceilings are tried on peaks measured once with
+    :meth:`~quantem.diffraction.polymer.BraggPeaksPolymer.measure_peak_widths`::
+
+        peaks = bp.measure_peak_widths(params)
+        params = selection_box(peaks, params, max_width_theta_deg=8.0)
+        result = bp.detect_ice(params, peaks=peaks)
+
+    Parameters
+    ----------
+    peaks : Vector
+        Polar peaks with ``width_q`` and ``width_theta`` fields.
+    params : IceFlaggerParams, optional
+        Settings to start from; the width ceilings are replaced.
+    max_width_q_invA, max_width_theta_deg : float, optional
+        Ceilings to try; None leaves that width ungated.
+    scan_mask : ndarray of bool, optional
+        Scan positions to include, as in :func:`detect_ice`.
+    fig_path : str or Path, optional
+        Also save the figure here.
+
+    Returns
+    -------
+    IceFlaggerParams
+        ``params`` with the two ceilings set.
+    """
+    p = dataclasses.replace(
+        IceFlaggerParams() if params is None else params,
+        max_width_q_invA=max_width_q_invA,
+        max_width_theta_deg=max_width_theta_deg,
+    )
+    fields = ["q", "intensity", "width_q", "width_theta"]
+    missing = [f for f in fields if f not in peaks.fields]
+    if missing:
+        raise ValueError(
+            f"peaks has no field(s) {missing}; measure them with measure_peak_widths."
+        )
+    data = peaks.select_fields(fields).numpy().astype(np.float64)
+    analyzed = _analyzed_rows(peaks, scan_mask)
+    cell = np.repeat(np.arange(int(np.prod(peaks.shape))), peaks.row_counts())
+    threshold = _intensity_threshold(data[analyzed, 1], p)
+    band = analyzed & (np.abs(data[:, 0] - p.q_target_invA) <= p.dq_invA)
+    intensity, width_q, width_theta = (
+        data[band, 1],
+        data[band, 2],
+        np.rad2deg(data[band, 3]),
+    )
+    selected = intensity >= threshold
+    if p.max_width_q_invA is not None:
+        selected &= width_q <= p.max_width_q_invA
+    if p.max_width_theta_deg is not None:
+        selected &= width_theta <= p.max_width_theta_deg
+
+    fig, axes = plt.subplots(2, 2, figsize=(12.5, 9))
+
+    def density(ax, x, y, x_max, y_min, y_max, xlabel, ylabel):
+        finite = np.isfinite(x) & np.isfinite(y)
+        hist = ax.hist2d(x[finite], y[finite], bins=80, norm=LogNorm(), cmap="magma")
+        fig.colorbar(hist[3], ax=ax, label="peaks (log scale)")
+        (x_lo, x_hi), (y_lo, y_hi) = ax.get_xlim(), ax.get_ylim()
+        right = x_hi if x_max is None else x_max
+        bottom = y_lo if y_min is None else y_min
+        top = y_hi if y_max is None else y_max
+        ax.add_patch(
+            Rectangle((x_lo, bottom), right - x_lo, top - bottom, facecolor="cyan", alpha=0.15)
+        )
+        for value, line in (
+            (x_max, ax.axvline),
+            (y_min, ax.axhline),
+            (y_max, ax.axhline),
+        ):
+            if value is not None:
+                line(value, color="cyan", ls="--", lw=2)
+        ax.set(xlabel=xlabel, ylabel=ylabel)
+
+    floor = threshold if np.isfinite(threshold) else None
+    density(
+        axes[0, 0],
+        width_q,
+        intensity,
+        p.max_width_q_invA,
+        floor,
+        None,
+        "radial FWHM (1/Å)",
+        "intensity",
+    )
+    density(
+        axes[0, 1],
+        width_theta,
+        intensity,
+        p.max_width_theta_deg,
+        floor,
+        None,
+        "annular FWHM (deg)",
+        "intensity",
+    )
+    bright = intensity >= threshold
+    density(
+        axes[1, 0],
+        width_q[bright],
+        width_theta[bright],
+        p.max_width_q_invA,
+        None,
+        p.max_width_theta_deg,
+        "radial FWHM (1/Å)",
+        "annular FWHM (deg)",
+    )
+    axes[1, 0].set_title(f"intensity >= {threshold:.3g}")
+
+    counts = np.bincount(cell[band][selected], minlength=int(np.prod(peaks.shape)))
+    image = axes[1, 1].imshow(counts.reshape(peaks.shape), cmap="inferno", interpolation="nearest")
+    fig.colorbar(image, ax=axes[1, 1], label="selected peaks")
+    axes[1, 1].set_title("selected peaks across the scan")
+    axes[1, 1].axis("off")
+    fig.suptitle(f"{selected.sum()} of {band.sum()} peaks in the q window pass both gates")
+    fig.tight_layout()
+    if fig_path is not None:
+        fig.savefig(fig_path, bbox_inches="tight")
+    plt.show()
+    return p
+
+
+def orientation_histograms(
+    peaks: Vector,
+    result: IceDetectionResult,
+    params: IceFlaggerParams | None = None,
+    theta_step_deg: float = 2.0,
+    sigma_theta: float = 3.0,
+    fig_path=None,
+) -> dict[str, NDArray]:
+    """Orientation histograms in the ice q window for all, kept and removed peaks.
+
+    Ice shows as compact spots on the scan and narrow spikes in theta; polymer
+    signal is spread out and broad, so it should stay in the kept panel.
+
+    Parameters
+    ----------
+    peaks : Vector
+        The polar peaks that ``result`` was computed from.
+    result : IceDetectionResult
+        Output of :func:`detect_ice`.
+    params : IceFlaggerParams, optional
+        Gives the q window.
+    theta_step_deg, sigma_theta : float
+        Theta bin size and smoothing in degrees.
+    fig_path : str or Path, optional
+        Also save the figure here.
+
+    Returns
+    -------
+    dict
+        ``(scan_row, scan_col, num_theta)`` histograms keyed ``"all"``, ``"kept"``
+        and ``"removed"``.
+    """
+    from quantem.diffraction.polymer_orientation import make_orientation_histogram
+
+    p = IceFlaggerParams() if params is None else params
+    window = (p.q_target_invA - p.dq_invA, p.q_target_invA + p.dq_invA)
+    subsets = {
+        "all": peaks,
+        "kept": result.filter(peaks),
+        "removed": result.filter(peaks, invert=True),
+    }
+    hists = {
+        label: make_orientation_histogram(
+            subset,
+            window,
+            upsample_factor=1,
+            theta_step_deg=theta_step_deg,
+            sigma_x=0,
+            sigma_y=0,
+            sigma_theta=sigma_theta,
+            normalize=None,
+        )[0]
+        for label, subset in subsets.items()
+    }
+
+    theta = np.arange(0, 180, theta_step_deg)
+    vmax = max(float(h.max()) for h in hists.values()) or 1.0
+    ymax = max(float(h.sum(axis=(0, 1)).max()) for h in hists.values()) or 1.0
+    fig, axes = plt.subplots(3, 2, figsize=(9, 9.6), gridspec_kw={"width_ratios": [1, 1.3]})
+    for (label, hist), (ax_map, ax_theta) in zip(hists.items(), axes):
+        image = ax_map.imshow(
+            hist.max(axis=2), cmap="inferno", vmin=0, vmax=vmax, interpolation="nearest"
+        )
+        fig.colorbar(image, ax=ax_map, fraction=0.046)
+        ax_map.set_title(f"{label}: maximum over theta", fontsize=9)
+        ax_map.axis("off")
+        ax_theta.plot(theta, hist.sum(axis=(0, 1)), lw=1.2)
+        ax_theta.set(
+            xlim=(0, 180),
+            ylim=(0, 1.05 * ymax),
+            xlabel="theta (deg)",
+            ylabel="summed intensity",
+        )
+        ax_theta.set_title(f"{label}: summed over the scan", fontsize=9)
+    fig.suptitle(
+        f"q = {window[0]:.3f}-{window[1]:.3f} 1/Å (d = {1 / window[1]:.2f}-{1 / window[0]:.2f} Å)",
+        fontsize=10,
+    )
+    fig.tight_layout()
+    if fig_path is not None:
+        fig.savefig(fig_path, bbox_inches="tight")
+    plt.show()
+    return hists

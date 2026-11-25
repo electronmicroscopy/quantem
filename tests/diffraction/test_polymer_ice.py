@@ -1,9 +1,19 @@
+import dataclasses
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pytest
 
 from quantem.core.datastructures import Vector
 from quantem.diffraction.calibration import _ellipse_matrix, ellipse_from_axes
-from quantem.diffraction.polymer_ice import IceFlaggerParams, detect_ice, measure_peak_widths
+from quantem.diffraction.polymer_ice import (
+    IceFlaggerParams,
+    detect_ice,
+    measure_peak_widths,
+    orientation_histograms,
+    plot_q_intensity_density,
+    selection_box,
+)
 
 FIELDS = ["q", "theta", "intensity"]
 
@@ -132,3 +142,37 @@ def test_require_friedel_pair_rejects_close_peaks():
     for pair, expected in ((False, [True] * 6), (True, [True] * 4 + [False] * 2)):
         p = IceFlaggerParams(intensity_cutoff=0.5, min_peaks_per_arm=2, require_friedel_pair=pair)
         assert _flags(detect_ice(peaks, p)).tolist() == expected, pair
+
+
+def test_ice_figures(tmp_path):
+    # rows of [q, theta_deg, intensity, width_q, width_theta_deg]
+    lattice = [[1.61, 10 + 60 * k, 1.0, 0.01, 3.0] for k in range(6)]
+    arc = [[1.61, a, 0.8, 0.01, 30.0] for a in (40, 220)]
+    other = [[0.6, 15.0, 0.2, np.nan, np.nan]]
+    cells = [[lattice + other, arc + other], [[], []]]
+    cells = [[np.array(c, dtype=np.float64).reshape(-1, 5) for c in row] for row in cells]
+    for c in (c for row in cells for c in row):
+        c[:, [1, 4]] = np.deg2rad(c[:, [1, 4]])
+    peaks = Vector.from_data(cells, fields=FIELDS + ["width_q", "width_theta"])
+    params = IceFlaggerParams(intensity_cutoff=0.5, min_matches=2)
+
+    # the plotted threshold is the one detect_ice applies
+    percentile = dataclasses.replace(params, intensity_cutoff=None, intensity_percentile_global=50)
+    for p in (params, percentile):
+        _, ax = plot_q_intensity_density(peaks, p)
+        threshold = detect_ice(peaks, p).intensity_threshold
+        assert f"{threshold:.3g}" in ax.texts[0].get_text()
+
+    tuned = selection_box(peaks, params, max_width_theta_deg=10.0, fig_path=tmp_path / "box.png")
+    assert (tuned.max_width_theta_deg, tuned.max_width_q_invA) == (10.0, None)
+    assert plt.gcf()._suptitle.get_text().startswith("6 of 8")
+    assert (tmp_path / "box.png").exists()
+    with pytest.raises(ValueError, match="width_q"):
+        selection_box(peaks.select_fields(FIELDS), params)
+
+    result = detect_ice(peaks, tuned)
+    hists = orientation_histograms(peaks, result, tuned)
+    assert np.allclose(hists["all"], hists["kept"] + hists["removed"])
+    assert np.isclose(hists["removed"].sum(), 6.0)
+    assert np.isclose(hists["kept"].sum(), 1.6)
+    plt.close("all")
