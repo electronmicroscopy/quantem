@@ -62,7 +62,7 @@ class IceFlaggerParams:
         found lattice.
     intensity_cutoff : float, optional
         Absolute intensity threshold. If None, the ``intensity_percentile_global``
-        percentile of all peak intensities in the analysed scan positions is used.
+        percentile of all peak intensities in the analyzed scan positions is used.
     intensity_percentile_global : float
         Scan-wide percentile used when ``intensity_cutoff`` is None.
     max_width_q_invA, max_width_theta_deg : float, optional
@@ -272,7 +272,7 @@ def detect_ice(
     params : IceFlaggerParams, optional
         Detection settings.
     scan_mask : ndarray of bool, optional
-        Scan positions to analyse. Peaks elsewhere are never flagged and do not
+        Scan positions to analyze. Peaks elsewhere are never flagged and do not
         enter the intensity percentile.
     return_debug : bool
         Also return per-position counts and the lattices found.
@@ -299,15 +299,15 @@ def detect_ice(
     cell_of_row = np.repeat(np.arange(len(counts)), counts)
     data = peaks.select_fields(fields).numpy().astype(np.float64)
     q, theta, intensity = data[:, 0], data[:, 1], data[:, 2]
-    analysed = selected.ravel()[cell_of_row]
+    analyzed = selected.ravel()[cell_of_row]
 
-    in_q = analysed & np.isfinite(theta) & (np.abs(q - p.q_target_invA) <= p.dq_invA)
+    in_q = analyzed & np.isfinite(theta) & (np.abs(q - p.q_target_invA) <= p.dq_invA)
     sharp = in_q.copy()
     if p.max_width_q_invA is not None:
         sharp &= data[:, fields.index("width_q")] <= p.max_width_q_invA
     if p.max_width_theta_deg is not None:
         sharp &= np.rad2deg(data[:, fields.index("width_theta")]) <= p.max_width_theta_deg
-    threshold = _intensity_threshold(intensity[analysed], p)
+    threshold = _intensity_threshold(intensity[analyzed], p)
     candidate = sharp & (intensity >= threshold)
     n_candidates = np.bincount(cell_of_row[candidate], minlength=len(counts))
 
