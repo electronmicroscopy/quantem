@@ -517,7 +517,7 @@ class BraggPeaksPolymer(BraggVectors):
         out.metadata.update({k: v for k, v in self.peaks.metadata.items() if "scan" in k})
         return out
 
-    def detect_ice(self, params=None, measure_widths: bool | None = None):
+    def detect_ice(self, params=None, measure_widths: bool | None = None, peaks=None):
         """Flag crystalline-ice peaks; see :func:`~quantem.diffraction.polymer_ice.detect_ice`.
 
         Parameters
@@ -527,19 +527,45 @@ class BraggPeaksPolymer(BraggVectors):
         measure_widths : bool, optional
             Measure each candidate's radial and annular width from the patterns,
             for the sharpness gate. Defaults to whether ``params`` sets a width
-            ceiling.
+            ceiling and ``peaks`` has no width fields.
+        peaks : Vector, optional
+            Polar peaks to test, e.g. from :meth:`measure_peak_widths`; defaults to
+            :meth:`polar_peaks`.
         """
         from quantem.diffraction import polymer_ice
 
         params = polymer_ice.IceFlaggerParams() if params is None else params
-        peaks = self.polar_peaks()
+        peaks = self.polar_peaks() if peaks is None else peaks
         if measure_widths is None:
-            measure_widths = (
+            measure_widths = "width_q" not in peaks.fields and (
                 params.max_width_q_invA is not None or params.max_width_theta_deg is not None
             )
         if measure_widths:
-            peaks = self._add_peak_widths(peaks, params)
+            peaks = self.measure_peak_widths(params, peaks)
         return polymer_ice.detect_ice(peaks, params=params, scan_mask=self.scan_mask)
+
+    def measure_peak_widths(self, params=None, peaks=None) -> Vector:
+        """Polar peaks with their radial and annular widths, measured on the patterns.
+
+        Only peaks in the ice q window of ``params`` are measured; the rest are
+        NaN. See :func:`~quantem.diffraction.polymer_ice.measure_peak_widths`.
+
+        Parameters
+        ----------
+        params : IceFlaggerParams, optional
+            The q window and width-measurement settings.
+        peaks : Vector, optional
+            Defaults to :meth:`polar_peaks`.
+
+        Returns
+        -------
+        Vector
+            ``peaks`` with ``width_q`` (1/Angstrom) and ``width_theta`` (radians) fields.
+        """
+        from quantem.diffraction.polymer_ice import IceFlaggerParams
+
+        params = IceFlaggerParams() if params is None else params
+        return self._add_peak_widths(self.polar_peaks() if peaks is None else peaks, params)
 
     # ---- helpers ----
 

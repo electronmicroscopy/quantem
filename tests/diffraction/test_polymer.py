@@ -166,6 +166,12 @@ def test_detect_ice_measures_widths_on_the_patterns():
         for c in (result.filter(bp.peaks)[0, 0].numpy(), result.filter(bp.peaks)[0, 1].numpy())
     ] == [1, 7]
 
+    # widths measured once and passed in give the same result
+    measured = bp.measure_peak_widths(params)
+    assert {"width_q", "width_theta"} <= set(measured.fields)
+    reused = bp.detect_ice(params, peaks=measured)
+    assert np.array_equal(reused.mask.numpy(), result.mask.numpy())
+
 
 def test_save_records_the_model_instead_of_its_weights(tmp_path):
     model = CNN2d(in_channels=1, out_channels=2, start_filters=4, num_layers=2)
