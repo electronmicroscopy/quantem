@@ -21,6 +21,45 @@ RADIAL_MAX_PERCENTILE = 0.1
 # but is noted where the call occures
 
 
+def as_dataset4dstem(data) -> Dataset4dstem:
+    """
+    Normalize a dataset to 4D-STEM form so the polar/PADF pipeline can treat
+    all inputs uniformly:
+
+    - 2D (single diffraction pattern)  -> (1, 1, H, W)
+    - 3D (stack of patterns)           -> (N, 1, H, W)
+    - 4D                               -> unchanged
+
+    The detector calibration (last two dims) is preserved; wrapped scan dims
+    get sampling 1 pixel.
+    """
+    if data.ndim == 4:
+        return data
+    arr = data.array if data.array is not None else to_numpy(data.tensor)
+    sampling = np.asarray(data.sampling, dtype=float)
+    origin = np.asarray(data.origin, dtype=float)
+    units = list(data.units)
+    if data.ndim == 2:
+        arr4 = arr[None, None]
+        scan_sampling = [1.0, 1.0]
+    elif data.ndim == 3:
+        arr4 = arr[:, None]
+        scan_sampling = [float(sampling[0]), 1.0]
+    else:
+        raise ValueError(
+            f"Got array with shape {data.shape}. "
+            "Expected a 2D pattern, 3D stack of patterns, or 4D-STEM dataset."
+        )
+    return Dataset4dstem.from_array(
+        arr4,
+        name=data.name,
+        origin=np.concatenate([np.zeros(2), origin[-2:]]),
+        sampling=np.concatenate([scan_sampling, sampling[-2:]]),
+        units=["pixels", "pixels"] + units[-2:],
+        signal_units=data.signal_units,
+    )
+
+
 def find_origin_angular_grid(
     data: Dataset4dstem,
     *,
@@ -82,28 +121,23 @@ def find_origin_angular_grid(
         Array of shape (scan_row, scan_col, 2) containing (row, col) origin
         estimates in pixels.
     """
-    if data.ndim == 2:
-        n_row, n_col = data.shape
-        scan_row, scan_col = 1, 1
-    elif data.ndim == 4:
-        scan_row, scan_col, n_row, n_col = data.shape
-    else:
-        raise ValueError(
-            f" Got array with shape {data.shape}."
-            "To use find_origin_angular_grid, pass a 2D or 4DSTEM dataset."
-        )
+    data = as_dataset4dstem(data)
+    scan_row, scan_col, n_row, n_col = data.shape
 
-    # Move the full dataset to the chosen device once
+    # Patterns stay in their own dtype and are converted to float32 one batch at
+    # a time, so the dataset is never copied whole
     dps = (
         torch.from_numpy(np.ascontiguousarray(data.array))
         if data.array is not None
         else data.tensor
     )
-    array_t = dps.to(device=device, dtype=torch.float32)
-    if array_t.ndim == 2:
-        array_t = array_t[None, None]
+    flat_dps = dps.reshape(-1, n_row, n_col)
+    n_pos = flat_dps.shape[0]
     # first get COM of mean DP because it gives a robust rough center
-    mean_dp_t = array_t.mean(dim=(0, 1))
+    mean_dp_t = torch.zeros((n_row, n_col), dtype=torch.float64, device=device)
+    for start in range(0, n_pos, 256):
+        mean_dp_t += flat_dps[start : start + 256].to(device=device, dtype=torch.float64).sum(0)
+    mean_dp_t = (mean_dp_t / n_pos).to(torch.float32)
     total_intensity = mean_dp_t.sum()
     row_grid_t = torch.arange(n_row, dtype=torch.float32, device=device)[:, None]
     col_grid_t = torch.arange(n_col, dtype=torch.float32, device=device)[None, :]
@@ -236,8 +270,6 @@ def find_origin_angular_grid(
     fine_drow, fine_dcol = (
         m.reshape(-1) for m in torch.meshgrid(fine_search_range, fine_search_range, indexing="ij")
     )
-    flat_dps_t = array_t.reshape(-1, n_row, n_col)
-    n_pos = flat_dps_t.shape[0]
     origin_flat_t = torch.zeros(n_pos, 2, dtype=torch.float32, device=device)
 
     def refine(dp_batch, current_row, current_col, drow, dcol):
@@ -288,7 +320,8 @@ def find_origin_angular_grid(
     for start in range(0, n_pos, batch_size):
         end = min(start + batch_size, n_pos)
         n_dp = end - start  # number of diffraction patterns in this batch chunk
-        dp_b = flat_dps_t[start:end].unsqueeze(1)  # (B, 1, H, W)
+        # (B, 1, H, W)
+        dp_b = flat_dps[start:end].to(device=device, dtype=torch.float32).unsqueeze(1)
         # Coarse (shared grids): broadcast B DPs across n_coarse candidate
         # grids in one grid_sample call by stacking DPs in the channel dim
         # and stride-0 expanding along the candidate dim
@@ -396,11 +429,7 @@ def polar_transform(
     device: str = "cpu",
     batch_size: int = 128,
 ) -> Polar4dstem | torch.Tensor:
-    if data.ndim != 4:
-        raise ValueError(
-            f"Found array with shape: {data.shape}. "
-            "polar_transform requires a 4D-STEM dataset (ndim=4)."
-        )
+    data = as_dataset4dstem(data)
     scan_row, scan_col, n_row, n_col = data.shape
 
     # Standardize origin_array input
@@ -471,40 +500,10 @@ def polar_transform(
         )
         return polar2d.squeeze(0).squeeze(0)  # (n_phi, n_r)
 
-    # Every scan position must map to the same-size polar grid (required for a
-    # uniform 4D output), so one radius has to serve all origins. Using from a
-    # low percentile rather than the minimum prevents a of failed origin fit
-    # from truncating the whole dataset's q-axis.
     if radial_max is None:
-        stretch_row, stretch_col = _ellipse_stretch_factors(ellipse_params)
-        r_row_pos = origins[:, :, 0] / stretch_row
-        r_row_neg = ((n_row - 1) - origins[:, :, 0]) / stretch_row
-        r_col_pos = origins[:, :, 1] / stretch_col
-        r_col_neg = ((n_col - 1) - origins[:, :, 1]) / stretch_col
-        radial_max_eff_array = np.minimum.reduce([r_row_pos, r_row_neg, r_col_pos, r_col_neg])
-        radial_max = float(
-            max(
-                np.percentile(radial_max_eff_array, RADIAL_MAX_PERCENTILE),
-                radial_min + radial_step,
-            )
+        radial_max = _shared_radial_max(
+            origins, n_row, n_col, ellipse_params, radial_min, radial_step
         )
-        # Positions in the percentile tail sample past the detector edge and are
-        # zero-filled there. The tail is non-empty by construction, and most of
-        # it only grazes the edge by a fraction of a pixel, which costs nothing.
-        # Warn only where a position loses a whole radial bin or more: that is a
-        # bad origin fit, not an artifact of choosing a percentile.
-        shortfall = radial_max - radial_max_eff_array
-        n_bad = int((shortfall > radial_step).sum())
-        if n_bad:
-            worst = float(radial_max_eff_array.min())
-            warnings.warn(
-                f"polar_transform: {n_bad} of {radial_max_eff_array.size} scan "
-                "positions have origins too close to the detector edge for "
-                f"radial_max={radial_max:.2f} px and lose more than one radial "
-                f"bin to zero-padding (the worst supports only {worst:.2f} px). "
-                "This is likely due to a failed origin fit.",
-                stacklevel=2,
-            )
 
     # Build origin-independent polar offsets ONCE. Only the per-origin shift
     # changes from one scan position to the next, so we can reuse these.
@@ -521,12 +520,6 @@ def polar_transform(
     n_r = radial_bins.numel()
     radial_max_eff = float(radial_max)
 
-    # Pre-normalize offsets into grid_sample's [-1, 1] coordinate convention
-    col_norm_scale = 2.0 / (n_col - 1)
-    row_norm_scale = 2.0 / (n_row - 1)
-    base_col_norm = offset_col * col_norm_scale  # (n_phi, n_r)
-    base_row_norm = offset_row * row_norm_scale  # (n_phi, n_r)
-
     # Flatten scan dims so we can iterate in flat batches
     n_pos = scan_row * scan_col
     dps = (
@@ -542,23 +535,9 @@ def polar_transform(
     out = torch.empty((n_pos, n_phi, n_r), dtype=torch.float32, device=device)
     for start in tqdm(range(0, n_pos, batch_size), desc="Polar transform"):
         end = min(start + batch_size, n_pos)
-        # Translate the precomputed offsets to each origin in this batch
-        row_origins = origins_t[start:end, 0]
-        col_origins = origins_t[start:end, 1]
-        grid_col = base_col_norm.unsqueeze(0) + (col_origins * col_norm_scale - 1.0)[:, None, None]
-        grid_row = base_row_norm.unsqueeze(0) + (row_origins * row_norm_scale - 1.0)[:, None, None]
-        # grid_sample requires (col, row) ordering in the last dim
-        grids = torch.stack([grid_col, grid_row], dim=-1)
-
-        dp_batch = dp_view[start:end].to(device=device, dtype=torch.float32)
-        polars = F.grid_sample(
-            dp_batch.unsqueeze(1),
-            grids,
-            mode="bilinear",
-            padding_mode="zeros",
-            align_corners=True,
+        out[start:end] = _sample_polar(
+            dp_view[start:end].to(device=device), origins_t[start:end], offset_row, offset_col
         )
-        out[start:end] = polars.squeeze(1)
     out = out.reshape(scan_row, scan_col, n_phi, n_r)
 
     # Get polar axes in physical units matching the input dataset's calibration
@@ -600,6 +579,79 @@ def polar_transform(
         origin_array=origins,
         _token=Polar4dstem._token,
     )
+
+
+def _shared_radial_max(
+    origins: NDArray,
+    n_row: int,
+    n_col: int,
+    ellipse_params: tuple[float, float, float] | None,
+    radial_min: float,
+    radial_step: float,
+) -> float:
+    """One radial_max (px) for all origins (scan_row, scan_col, 2).
+
+    Every scan position must map to the same-size polar grid, so one radius has
+    to serve all origins. A low percentile of the per-origin in-frame radius,
+    rather than the minimum, keeps a failed origin fit from truncating the
+    q-axis of the whole dataset.
+    """
+    stretch_row, stretch_col = _ellipse_stretch_factors(ellipse_params)
+    r_row_pos = origins[:, :, 0] / stretch_row
+    r_row_neg = ((n_row - 1) - origins[:, :, 0]) / stretch_row
+    r_col_pos = origins[:, :, 1] / stretch_col
+    r_col_neg = ((n_col - 1) - origins[:, :, 1]) / stretch_col
+    radial_max_eff_array = np.minimum.reduce([r_row_pos, r_row_neg, r_col_pos, r_col_neg])
+    radial_max = float(
+        max(
+            np.percentile(radial_max_eff_array, RADIAL_MAX_PERCENTILE),
+            radial_min + radial_step,
+        )
+    )
+    # Positions in the percentile tail sample past the detector edge and are
+    # zero-filled there. The tail is non-empty by construction, and most of
+    # it only grazes the edge by a fraction of a pixel, which costs nothing.
+    # Warn only where a position loses a whole radial bin or more: that is a
+    # bad origin fit, not an artifact of choosing a percentile.
+    shortfall = radial_max - radial_max_eff_array
+    n_bad = int((shortfall > radial_step).sum())
+    if n_bad:
+        worst = float(radial_max_eff_array.min())
+        warnings.warn(
+            f"polar_transform: {n_bad} of {radial_max_eff_array.size} scan "
+            "positions have origins too close to the detector edge for "
+            f"radial_max={radial_max:.2f} px and lose more than one radial "
+            f"bin to zero-padding (the worst supports only {worst:.2f} px). "
+            "This is likely due to a failed origin fit.",
+            stacklevel=3,
+        )
+    return radial_max
+
+
+def _sample_polar(
+    patterns: torch.Tensor,
+    origins: torch.Tensor,
+    offset_row: torch.Tensor,
+    offset_col: torch.Tensor,
+) -> torch.Tensor:
+    """Bilinear polar samples (B, n_phi, n_r), float32, of patterns (B, H, W)
+    about their origins (B, 2) (row, col), at the pixel offsets of
+    _build_polar_sampling_offsets. Samples outside the pattern are zero."""
+    n_row, n_col = patterns.shape[-2:]
+    # Normalize into grid_sample's [-1, 1] coordinates, translated to each origin
+    col_scale, row_scale = 2.0 / (n_col - 1), 2.0 / (n_row - 1)
+    grid_col = (offset_col * col_scale)[None] + (origins[:, 1] * col_scale - 1.0)[:, None, None]
+    grid_row = (offset_row * row_scale)[None] + (origins[:, 0] * row_scale - 1.0)[:, None, None]
+    # grid_sample requires (col, row) ordering in the last dim
+    grids = torch.stack([grid_col, grid_row], dim=-1)
+    polars = F.grid_sample(
+        patterns.to(dtype=torch.float32).unsqueeze(1),
+        grids,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    )
+    return polars.squeeze(1)
 
 
 def _polar_to_cartesian_offsets(
