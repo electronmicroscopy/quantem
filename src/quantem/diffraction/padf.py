@@ -92,9 +92,11 @@ from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.datastructures.polar4dstem import Polar4dstem
 from quantem.core.utils.utils import electron_wavelength_angstrom
 from quantem.diffraction.polar_transform import (
+    _build_polar_sampling_offsets,
+    _sample_polar,
+    _shared_radial_max,
     as_dataset4dstem,
     find_origin_angular_grid,
-    polar_transform,
 )
 
 
@@ -137,7 +139,11 @@ class PairAngleDistributionFunction:
         weight, as a fraction of k_max, which keeps sidelobes below 1% for a
         resolution in r of about 0.5 / (damping k_max). None turns it off.
     batch_size : int
-        Patterns per chunk when accumulating the moments.
+        Largest number of patterns per chunk when accumulating the moments.
+    max_memory_gb : float
+        Memory budget (GB) of the working arrays of one chunk. The patterns of
+        each dataset are copied, split and transformed one chunk at a time, so
+        the memory used does not grow with the number of patterns.
     split_counts : bool
         The patterns are electron counts: split the electrons of each pattern
         at random into two halves, whose shot noise is independent, and
@@ -167,6 +173,7 @@ class PairAngleDistributionFunction:
         taper: tuple[float, float] = (0.1, 0.25),
         damping: float | None = 0.6,
         batch_size: int = 512,
+        max_memory_gb: float = 2.0,
         split_counts: bool = False,
         seed: int = 0,
     ):
@@ -180,20 +187,17 @@ class PairAngleDistributionFunction:
         sum_M = sum_S = None
         self.n_patterns = 0
         for item in items:
-            if split_counts:
-                *halves, item_origin = _split_counts(item, origin, gen)
-            else:
-                halves, item_origin = [item], origin
-            polars = [self._to_polar(h, item_origin, ellipse_params, n_phi) for h in halves]
+            patterns = _PolarPatterns(item, origin, ellipse_params, n_phi, split_counts)
             if sum_M is None:
-                self._set_geometry(polars[0], fq)
-            elif polars[0].shape[-1] != self.q.size:
+                self._set_geometry(patterns.n_phi, patterns.q, fq)
+            elif patterns.q.size != self.q.size:
                 raise ValueError("all datasets need the same radial axis")
-            stacks = [
-                p.tensor.reshape(-1, p.shape[-2], p.shape[-1]).to(torch.float64) for p in polars
-            ]
-            for start in range(0, stacks[0].shape[0], batch_size):
-                F = [self._harmonics(x[start : start + batch_size]) for x in stacks]
+            size = int(max_memory_gb * 1e9 / patterns.bytes_per_pattern)
+            size = max(1, min(batch_size, size))
+            for start in range(0, patterns.n_patterns, size):
+                polars = patterns.chunk(start, start + size, gen)
+                F = [self._harmonics(x) for x in polars]
+                del polars
                 if split_counts:  # each half carries half the intensity and independent noise
                     M = (F[0] + F[1]).sum(dim=0)
                     S = 2 * torch.einsum("bnk,bnj->nkj", F[0].conj(), F[1])
@@ -204,6 +208,7 @@ class PairAngleDistributionFunction:
                 sum_M = M if sum_M is None else sum_M + M
                 sum_S = S if sum_S is None else sum_S + S
                 self.n_patterns += F[0].shape[0]
+                del F, M, S
 
         M = sum_M / self.n_patterns
         S = sum_S / self.n_patterns
@@ -232,25 +237,11 @@ class PairAngleDistributionFunction:
 
     # ------------------------------------------------------------------ moments
 
-    @staticmethod
-    def _to_polar(item, origin, ellipse_params, n_phi):
-        if isinstance(item, Polar4dstem):
-            return item
-        ds = as_dataset4dstem(item)
-        return polar_transform(
-            ds,
-            origin_array=_pattern_origin(ds, origin),
-            ellipse_params=ellipse_params,
-            num_annular_bins=n_phi,
-        )
-
-    def _set_geometry(self, polar, fq):
-        n_q = polar.shape[-1]
-        self.n_phi = polar.shape[-2]
+    def _set_geometry(self, n_phi, q, fq):
+        n_q = q.size
+        self.n_phi = n_phi
         self.n_max = self.n_phi // 2 - 1
-        self.q = float(np.asarray(polar.origin)[3]) + np.arange(n_q) * float(
-            np.asarray(polar.sampling)[3]
-        )
+        self.q = q
         half_angle = np.arcsin(np.clip(self.wavelength * self.q / 2, 0, 1))
         self.beta = np.pi / 2 + half_angle  # polar angle of q from the beam axis
         self.q_perp = self.q * np.cos(half_angle)  # component of q perpendicular to the beam
@@ -265,8 +256,10 @@ class PairAngleDistributionFunction:
         self._f2 = torch.from_numpy(np.ascontiguousarray(f2))
 
     def _harmonics(self, patterns):
-        """Circular harmonics (B, n_max + 1, Nk) of a stack of polar patterns (B, n_phi, Nk)."""
-        F = torch.fft.rfft(patterns / self._f2[None, None, :], dim=1) / self.n_phi
+        """Circular harmonics (B, n_max + 1, Nk), complex128, of a stack of polar
+        patterns (B, n_phi, Nk), which are divided by f(q)^2 in float64."""
+        F = torch.fft.rfft(patterns / self._f2[None, None, :], dim=1)
+        F /= self.n_phi
         return F[:, : self.n_max + 1, :]
 
     def _check_centering(self, threshold: float = 0.05):
@@ -642,16 +635,17 @@ class PairAngleDistributionFunction:
         for pos in clusters:
             pos = torch.as_tensor(np.asarray(pos), dtype=torch.float64)
             pos = pos[:, :2] if self.model == "beam" else pos
-            i, j = torch.triu_indices(pos.shape[0], pos.shape[0], offset=1)
-            index = torch.round(torch.linalg.norm(pos[i] - pos[j], dim=1) / bin_width).long()
-            if index.max() >= counts.numel():
-                counts = torch.cat(
-                    [
-                        counts,
-                        torch.zeros(int(index.max()) + 1 - counts.numel(), dtype=torch.float64),
-                    ]
-                )
-            counts.index_add_(0, index, torch.ones_like(index, dtype=torch.float64))
+            n = pos.shape[0]
+            block = max(1, 2**22 // max(n, 1))  # rows of atoms per block of pairs
+            for start in range(0, n - 1, block):
+                rows = torch.arange(start, min(start + block, n))
+                dist = torch.linalg.norm(pos[None, :, :] - pos[rows, None, :], dim=-1)
+                dist = dist[torch.arange(n)[None, :] > rows[:, None]]  # each pair once
+                index = torch.round(dist / bin_width).long()
+                grow = int(index.max()) + 1 - counts.numel()
+                if grow > 0:
+                    counts = torch.cat([counts, torch.zeros(grow, dtype=torch.float64)])
+                counts.index_add_(0, index, torch.ones_like(index, dtype=torch.float64))
         u = np.arange(counts.numel()) * bin_width
         if self.model == "sphere":
             pairs = np.sinc(2 * np.outer(self.q, u))  # j0(2 pi q u)
@@ -966,15 +960,15 @@ def order_parameter(
         maps = [g.correlation("sphere", r_max=10.0)[1] for g in groups]
         omega = order_parameter(maps, [g.Theta_self for g in groups], groups[0].r, groups[0].theta_deg)
     """
-    T, S = (
-        torch.as_tensor(np.stack([np.asarray(x) for x in maps]), dtype=torch.float64)
-        for maps in (Theta_groups, Theta_self_groups)
-    )
-    K = T.shape[0]
+    T, S = ([np.asarray(x) for x in maps] for maps in (Theta_groups, Theta_self_groups))
+    K = len(T)
     if K < 3:
         raise ValueError(f"order_parameter needs at least 3 groups, got {K}")
-    if T.shape != S.shape:
-        raise ValueError(f"Theta {tuple(T.shape)} and Theta_self {tuple(S.shape)} differ")
+    if len(S) != K or any(x.shape != T[0].shape for x in T + S):
+        raise ValueError(
+            f"Theta and Theta_self need {K} maps each of one shape, got "
+            f"{[x.shape for x in T]} and {[x.shape for x in S]}"
+        )
     theta = torch.as_tensor(np.asarray(theta_deg), dtype=torch.float64)
     if theta.max() <= 180:
         weight = torch.sin(torch.deg2rad(theta)).clamp(min=0)  # solid angle on the sphere
@@ -982,8 +976,10 @@ def order_parameter(
         weight = torch.ones_like(theta)  # angles around the beam
     root = torch.sqrt(weight / weight.mean())
 
-    def centered(x):
-        """Values of one bin (K, n, Ntheta) minus their weighted mean, times sqrt(weight)."""
+    def centered(maps, inside):
+        """Values of one bin (K, n, Ntheta) of the maps, taken one bin at a time,
+        minus their weighted mean, times sqrt(weight)."""
+        x = torch.as_tensor(np.stack([m[inside] for m in maps]), dtype=torch.float64)
         mean = (x * weight).sum((-2, -1), keepdim=True) / (weight.sum() * x.shape[-2])
         return ((x - mean) * root).reshape(K, -1)
 
@@ -997,7 +993,7 @@ def order_parameter(
         inside = (r_eff >= lo) & (r_eff < hi) & (r_short >= r_min)
         if not inside.any():
             raise ValueError(f"the r_eff bin from {lo:g} to {hi:g} A holds no points of the maps")
-        g, s = centered(T[:, inside]), centered(S[:, inside])
+        g, s = centered(T, inside.numpy()), centered(S, inside.numpy())
         grams.append((g @ g.T, s @ s.T))
 
     def profile(w):
@@ -1022,21 +1018,71 @@ def order_parameter(
     return OrderParameter(value, se, interval, 0.5 * (edges[:-1] + edges[1:]), full.numpy())
 
 
-def _split_counts(item, origin, gen):
-    """Two random halves of the electron counts of every pattern (binomial
-    thinning), and the pattern origin, found once from the full counts."""
-    if isinstance(item, Polar4dstem):
-        raise ValueError("split_counts needs the detector counts, not polar data")
-    ds = as_dataset4dstem(item)
-    counts = torch.as_tensor(np.asarray(ds.array), dtype=torch.float64)
-    if counts.min() < 0 or not torch.equal(counts, torch.round(counts)):
-        raise ValueError("split_counts needs non-negative integer counts")
-    half = torch.binomial(counts, torch.full_like(counts, 0.5), generator=gen)
-    a, b = (
-        Dataset4dstem.from_array(x.numpy(), origin=ds.origin, sampling=ds.sampling, units=ds.units)
-        for x in (half, counts - half)
-    )
-    return a, b, _pattern_origin(ds, origin)
+class _PolarPatterns:
+    """
+    Polar patterns of one dataset, made a chunk of scan positions at a time, so
+    that only one chunk is ever copied. The origins and the radial axis are set
+    from the whole dataset, so every chunk shares one q axis. With split_counts,
+    the electrons of each pattern are split at random into two halves (binomial
+    thinning), both transformed about the origins of the full counts.
+    """
+
+    def __init__(self, item, origin, ellipse_params, n_phi, split_counts):
+        self.split_counts = split_counts
+        if isinstance(item, Polar4dstem):
+            if split_counts:
+                raise ValueError("split_counts needs the detector counts, not polar data")
+            self.offsets = None
+            self.n_phi, n_q = item.shape[-2:]
+            q0, dq = float(np.asarray(item.origin)[3]), float(np.asarray(item.sampling)[3])
+        else:
+            item = as_dataset4dstem(item)
+            scan_row, scan_col, n_row, n_col = item.shape
+            origins = np.broadcast_to(
+                np.asarray(_pattern_origin(item, origin), dtype=float), (scan_row, scan_col, 2)
+            )
+            radial_max = _shared_radial_max(origins, n_row, n_col, ellipse_params, 0.0, 1.0)
+            offset_row, offset_col, _, radial_bins = _build_polar_sampling_offsets(
+                ellipse_params, n_phi, 0.0, radial_max, 1.0, False
+            )
+            self.offsets = (offset_row, offset_col)
+            self.origins = torch.from_numpy(
+                np.ascontiguousarray(origins.reshape(-1, 2), dtype=np.float32)
+            )
+            self.n_phi, n_q = n_phi, radial_bins.numel()
+            q0, dq = 0.0, float(np.asarray(item.sampling)[-1])
+        self.q = q0 + np.arange(n_q) * dq
+        self.data = item.array if item.array is not None else item.tensor
+        self.n_patterns = int(np.prod(self.data.shape[:-2]))
+        # working bytes per pattern: the copied counts, their halves and float32
+        # copies, and per half the polar pattern, its float64 harmonics and the
+        # copies of the moment products
+        n_pixels, n_polar = int(np.prod(self.data.shape[-2:])), self.n_phi * n_q
+        raw = self.data.itemsize + (0 if self.offsets is None else 24 if split_counts else 4)
+        self.bytes_per_pattern = n_pixels * raw + n_polar * (40 + 16 * (1 + split_counts))
+
+    def chunk(self, start, end, gen):
+        """Polar patterns (B, n_phi, Nk) of the patterns start to end in scan
+        order, one stack per half of the counts with split_counts."""
+        flat = np.arange(start, min(end, self.n_patterns))
+        index = np.unravel_index(flat, self.data.shape[:-2])
+        if isinstance(self.data, torch.Tensor):
+            index = tuple(torch.from_numpy(i) for i in index)
+        raw = torch.as_tensor(self.data[index]).cpu()  # a copy of this chunk only
+        if self.offsets is None:
+            return [raw]
+        if self.split_counts:
+            counts = raw.to(torch.float64)
+            del raw
+            if counts.min() < 0 or not torch.equal(counts, torch.round(counts)):
+                raise ValueError("split_counts needs non-negative integer counts")
+            p = torch.tensor(0.5, dtype=torch.float64).expand_as(counts)
+            half = torch.binomial(counts, p, generator=gen)
+            halves = [half, counts.sub_(half)]
+        else:
+            halves = [raw]
+        origins = self.origins[start : start + flat.size]
+        return [_sample_polar(h, origins, *self.offsets) for h in halves]
 
 
 def _pattern_origin(ds, origin):
@@ -1320,8 +1366,10 @@ def _cluster_power_sphere(clusters, r, l_values, memory=2**28, block=2048):
     return H
 
 
-def _cluster_power_beam(clusters, r, n_values):
-    """conj(P_n(r)) P_n(r') of the projected positions summed over clusters, P_n per unit area, (Nn, Nr, Nr)."""
+def _cluster_power_beam(clusters, r, n_values, memory=2**28):
+    """conj(P_n(r)) P_n(r') of the projected positions summed over clusters, P_n
+    per unit area, (Nn, Nr, Nr). The pair vectors are made a block of atoms at a
+    time, about `memory` bytes of working arrays per block."""
     r_t = torch.as_tensor(r, dtype=torch.float64)
     dr = float(r_t[1] - r_t[0])
     ring = 2 * np.pi * torch.clamp(r_t, min=0.5 * dr) * dr
@@ -1330,18 +1378,21 @@ def _cluster_power_beam(clusters, r, n_values):
     H = torch.zeros((len(n_values), r.size, r.size), dtype=torch.complex128)
     for pos in clusters:
         xy = torch.as_tensor(np.asarray(pos)[:, :2], dtype=torch.float64)
-        d = (xy[None, :, :] - xy[:, None, :]).reshape(-1, 2)
-        dist = torch.hypot(d[:, 0], d[:, 1])
-        keep = (dist > 0) & (dist >= float(r_t[0])) & (dist < float(r_t[-1]))
-        d, dist = d[keep], dist[keep]
-        index, weight = _bin_vectors(dist, r)
-        phi = torch.cat([torch.atan2(d[:, 0], d[:, 1])] * 2)
-        E = (weight / ring[index])[:, None] * torch.exp(
-            -1j * phi[:, None] * n_t[None, :]
-        )  # (Nvec, Nn)
-        A = torch.zeros((r.size + 1, len(n_values)), dtype=torch.complex128).index_add_(
-            0, index, E
-        )[: r.size]
+        n = xy.shape[0]
+        block = max(1, memory // (128 * n * (len(n_values) + 1)))  # source atoms per block
+        A = torch.zeros((r.size + 1, len(n_values)), dtype=torch.complex128)
+        for start in range(0, n, block):
+            d = (xy[None, :, :] - xy[start : start + block, None, :]).reshape(-1, 2)
+            dist = torch.hypot(d[:, 0], d[:, 1])
+            keep = (dist > 0) & (dist >= float(r_t[0])) & (dist < float(r_t[-1]))
+            d, dist = d[keep], dist[keep]
+            index, weight = _bin_vectors(dist, r)
+            phi = torch.cat([torch.atan2(d[:, 0], d[:, 1])] * 2)
+            E = (weight / ring[index])[:, None] * torch.exp(
+                -1j * phi[:, None] * n_t[None, :]
+            )  # (Nvec, Nn)
+            A.index_add_(0, index, E)
+        A = A[: r.size]
         H += torch.einsum("in,jn->nij", A.conj(), A)
     return H
 

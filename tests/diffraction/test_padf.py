@@ -197,22 +197,22 @@ def test_probe_patterns_bright_field_and_kinematic_limit():
 
 def test_split_counts_removes_shot_noise_bias():
     """Poisson noise on a flat pattern biases the second moment at k = k'; the
-    cross moment of two random halves of the counts does not."""
+    cross moment of two random halves of the counts does not. A memory budget
+    of a few patterns per chunk gives the same moments."""
     counts = np.random.default_rng(0).poisson(20.0, size=(200, 1, 48, 48)).astype(np.float32)
     ds = Dataset4dstem.from_array(
         counts, origin=(0, 0, -24, -24), sampling=(1, 1, 1, 1), units=["pixels"] * 4
     )
-    bias = [
-        np.diagonal(
-            PairAngleDistributionFunction(ds, k_min=4, k_max=20, split_counts=split).second_moment[
-                1:
-            ],
-            axis1=1,
-            axis2=2,
-        ).real.mean()
+    S = [
+        PairAngleDistributionFunction(ds, k_min=4, k_max=20, split_counts=split).second_moment
         for split in (False, True)
     ]
+    bias = [np.diagonal(s[1:], axis1=1, axis2=2).real.mean() for s in S]
     assert bias[0] > 0 and abs(bias[1]) < 0.1 * bias[0], bias
+    chunked = PairAngleDistributionFunction(
+        ds, k_min=4, k_max=20, split_counts=True, max_memory_gb=2e-3
+    ).second_moment
+    assert np.abs(chunked - S[1]).max() < 1e-12 * np.abs(S[1]).max()
 
 
 def test_order_parameter_removes_noise_bias():
