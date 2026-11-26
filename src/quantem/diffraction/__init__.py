@@ -15,3 +15,7 @@ from quantem.diffraction import crystal_rotations as crystal_rotations
 from quantem.diffraction import digital_dark_field as digital_dark_field
 from quantem.diffraction import ellipticity as ellipticity
 from quantem.diffraction import illumination as illumination
+from quantem.diffraction.polymer import BraggPeaksPolymer as BraggPeaksPolymer
+from quantem.diffraction import polymer_orientation as polymer_orientation
+from quantem.diffraction import polymer_ice as polymer_ice
+from quantem.diffraction import orientation_correlation as orientation_correlation

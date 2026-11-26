@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
+from quantem.diffraction.calibration import _ellipse_matrix, ellipse_from_axes
 from quantem.diffraction.ellipticity import (
     _amorphous_ring_model,
     convert_ellipse_params,
@@ -125,6 +126,23 @@ class TestFitEllipticalDistortion:
         angle_err = abs(theta_fit - theta_true)
         angle_err = min(angle_err, 180.0 - angle_err)  # handle wrapping
         assert angle_err < 5.0, f"theta: got {theta_fit:.1f}, expected {theta_true}"
+        assert not result["at_edge"]
+
+    def test_multi_seed_recovers_fit_stuck_at_edge(self):
+        """A bright beam tail pins the default fit at r_in; multi_seed finds the ring."""
+        a_true, b_true = 36.0, 32.0
+        ds = _make_synthetic_dataset(a=a_true, b=b_true, I1=50.0, sigma1=4.0, sigma2=6.0)
+        kwargs = dict(center=(128.0, 128.0), fit_radii=(20.0, 50.0))
+        with pytest.warns(UserWarning, match="edge of fit_radii"):
+            default = fit_elliptical_distortion(ds, **kwargs)
+        assert default["at_edge"]
+        result = fit_elliptical_distortion(ds, multi_seed=True, **kwargs)
+        assert not result["at_edge"]
+        a_fit, b_fit, _ = result["ellipse_params"]
+        assert abs(a_fit - a_true) / a_true < 0.02, f"a: got {a_fit:.2f}, expected {a_true}"
+        assert abs(b_fit - b_true) / b_true < 0.02, f"b: got {b_fit:.2f}, expected {b_true}"
+        with pytest.raises(ValueError, match="multi_seed"):
+            fit_elliptical_distortion(ds, p0=torch.ones(11), multi_seed=True, **kwargs)
 
     def test_recover_circular(self):
         """For a circular pattern (a==b), fitted a and b should be similar."""
@@ -208,3 +226,31 @@ def test_ellipse_correction_pipeline():
     ring_at_phi = arr[:, peak_r]
     cv = float(ring_at_phi.std() / ring_at_phi.mean())
     assert cv < 0.1, f"Ring varies across phi (cv={cv:.3f}); correction not applied."
+
+
+def test_textured_ring_fit_gives_calibration_correction():
+    """A ring with 2-fold texture, fit with amplitude harmonics, maps onto a circle."""
+    a, b, theta_deg = 40.0, 36.0, 25.0
+    offset_row, offset_col = torch.meshgrid(
+        torch.arange(128.0) - 63.5, torch.arange(128.0) - 63.5, indexing="ij"
+    )
+    A, B, C = convert_ellipse_params_r(a, b, np.radians(theta_deg))
+    params = torch.tensor([300.0, 50, 4, 3, 4, 1, 0, 0, A, B, C, 0, 0, 0.6, 0.5])
+    dp = _amorphous_ring_model(params, offset_row.reshape(-1), offset_col.reshape(-1))
+    ds = Dataset4dstem.from_array(dp.reshape(1, 1, 128, 128).numpy())
+    fit = fit_elliptical_distortion(
+        ds, center=(63.5, 63.5), fit_radii=(20.0, 55.0), n_harmonics=2, write_metadata=False
+    )
+    a_fit, b_fit, theta_fit = fit["ellipse_params"]
+    assert np.isclose(a_fit / b_fit, a / b, rtol=1e-3), a_fit / b_fit
+    assert np.isclose(theta_fit, theta_deg, atol=0.5), theta_fit
+
+    # DiffractionCalibration's [e11, e12] maps points on the ellipse to one radius
+    t = np.linspace(0, 2 * np.pi, 64)
+    th = np.radians(theta_deg)
+    rows = a * np.cos(t) * np.sin(th) + b * np.sin(t) * np.cos(th)
+    cols = a * np.cos(t) * np.cos(th) - b * np.sin(t) * np.sin(th)
+    radii = np.hypot(
+        *(np.stack([rows, cols], 1) @ _ellipse_matrix(ellipse_from_axes(a, b, theta_deg)).T).T
+    )
+    assert np.allclose(radii, 2 * a * b / (a + b))
